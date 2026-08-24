@@ -1,0 +1,158 @@
+syntax = "proto3";
+
+package loadforge;
+
+// This proto file defines the ideal gRPC interface for controller-worker
+// communication. In the initial implementation, we use HTTP/JSON for
+// simplicity (no gRPC C++ build dependency). This file serves as the
+// canonical interface specification and can be upgraded to gRPC later.
+
+// ─── Test Configuration ───
+
+message TestConfig {
+  string test_id = 1;
+  string target_url = 2;
+  string method = 3;                    // GET, POST, PUT, DELETE, etc.
+  map<string, string> headers = 4;
+  string body = 5;
+  
+  double requests_per_second = 6;       // Target RPS (0 = unlimited)
+  int32 concurrency = 7;               // Number of concurrent connections
+  int32 duration_seconds = 8;           // Test duration
+  int32 ramp_up_seconds = 9;           // Gradual ramp-up period
+  int32 ramp_down_seconds = 10;        // Gradual ramp-down period
+  int32 timeout_ms = 11;               // Per-request timeout in milliseconds
+  
+  bool keep_alive = 12;                // Use HTTP keep-alive
+  int32 max_connections = 13;          // Max connections in pool
+}
+
+// ─── Metrics ───
+
+message LatencyHistogram {
+  // Bucket boundaries and counts for latency distribution
+  // Buckets: [0-1ms, 1-2ms, 2-5ms, 5-10ms, 10-20ms, 20-50ms, 
+  //           50-100ms, 100-200ms, 200-500ms, 500ms-1s, 1-2s, 2-5s, 5-10s, 10s+]
+  repeated uint64 bucket_counts = 1;
+  repeated double bucket_boundaries = 2;
+  
+  double min_ms = 3;
+  double max_ms = 4;
+  double mean_ms = 5;
+  double p50_ms = 6;
+  double p90_ms = 7;
+  double p95_ms = 8;
+  double p99_ms = 9;
+  double p999_ms = 10;
+  
+  uint64 count = 11;                    // Total samples in histogram
+}
+
+message MetricsSnapshot {
+  string worker_id = 1;
+  string test_id = 2;
+  int64 timestamp_ms = 3;              // Unix timestamp in milliseconds
+  
+  // Counters (cumulative since test start)
+  uint64 total_requests = 4;
+  uint64 successful_requests = 5;
+  uint64 failed_requests = 6;
+  uint64 bytes_sent = 7;
+  uint64 bytes_received = 8;
+  
+  // Current interval metrics (since last snapshot)
+  double current_rps = 9;
+  int32 active_connections = 10;
+  int32 queue_depth = 11;
+  
+  // Status code distribution (since last snapshot)
+  map<int32, uint64> status_codes = 12;
+  
+  // Error breakdown (since last snapshot)
+  map<string, uint64> errors = 13;     // error_type -> count
+  
+  // Latency histogram (since last snapshot)
+  LatencyHistogram latency = 14;
+  
+  // Worker self-monitoring
+  double worker_cpu_percent = 15;
+  double worker_memory_mb = 16;
+}
+
+// ─── Test Results ───
+
+message TestResult {
+  string test_id = 1;
+  TestConfig config = 2;
+  
+  int64 start_time_ms = 3;
+  int64 end_time_ms = 4;
+  int32 actual_duration_seconds = 5;
+  
+  // Aggregate metrics
+  uint64 total_requests = 6;
+  uint64 successful_requests = 7;
+  uint64 failed_requests = 8;
+  double error_rate = 9;
+  
+  double mean_rps = 10;
+  double peak_rps = 11;
+  
+  uint64 total_bytes_sent = 12;
+  uint64 total_bytes_received = 13;
+  
+  LatencyHistogram latency = 14;
+  
+  map<int32, uint64> status_codes = 15;
+  map<string, uint64> errors = 16;
+  
+  // Per-second timeline
+  repeated MetricsSnapshot timeline = 17;
+  
+  string status = 18;                  // "completed", "failed", "cancelled"
+  string error_message = 19;
+}
+
+// ─── Worker Control ───
+
+message WorkerInfo {
+  string worker_id = 1;
+  string address = 2;                  // host:port
+  string status = 3;                   // "idle", "running", "error"
+  double cpu_percent = 4;
+  double memory_mb = 5;
+  int64 last_heartbeat_ms = 6;
+}
+
+message StartTestRequest {
+  TestConfig config = 1;
+}
+
+message StartTestResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message StopTestRequest {
+  string test_id = 1;
+}
+
+message StopTestResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  WorkerInfo info = 1;
+}
+
+// The gRPC service definition (for future upgrade)
+// Currently implemented as HTTP/JSON endpoints on the worker
+service WorkerService {
+  rpc StartTest(StartTestRequest) returns (StartTestResponse);
+  rpc StopTest(StopTestRequest) returns (StopTestResponse);
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+  rpc StreamMetrics(StatusRequest) returns (stream MetricsSnapshot);
+}

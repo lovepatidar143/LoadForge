@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'loadforge-controller'
+    static_configs:
+      - targets: ['controller:3001']
+    metrics_path: '/metrics'

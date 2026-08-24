@@ -1,0 +1,12 @@
+{
+  "name": "loadforge-target-server",
+  "version": "1.0.0",
+  "description": "Example target server for LoadForge",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

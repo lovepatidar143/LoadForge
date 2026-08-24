@@ -1,0 +1,22 @@
+# Stage 1: Build
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+COPY controller/package*.json ./
+RUN if [ -f package.json ]; then npm ci; else mkdir -p node_modules; fi
+
+COPY controller/ ./
+RUN if [ -f tsconfig.json ]; then npm run build; fi
+
+# Stage 2: Runtime
+FROM node:20-alpine
+
+WORKDIR /app
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/node_modules ./node_modules
+# Copy dist or raw JS if no build step
+COPY --from=builder /app/dist ./dist 2>/dev/null || true
+COPY --from=builder /app/src ./src 2>/dev/null || true
+
+EXPOSE 3001
+CMD ["node", "dist/index.js"] # Adjust this based on actual entry point

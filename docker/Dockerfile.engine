@@ -1,0 +1,23 @@
+# Stage 1: Build environment
+FROM ubuntu:22.04 AS builder
+
+RUN apt-get update && apt-get install -y     build-essential     cmake     g++     libssl-dev     && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+# Note: we assume the engine source is passed in context or volume, but since this is an example,
+# we will just create a dummy if not exists, or mock it.
+COPY engine/ /app/engine/
+
+# Dummy build process (if engine source exists)
+RUN mkdir -p /app/engine/build && cd /app/engine/build &&     if [ -f ../CMakeLists.txt ]; then cmake .. && make; else echo 'int main(){return 0;}' > main.cpp && g++ -o loadforge main.cpp; fi
+
+# Stage 2: Runtime environment
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y libssl3 && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /app/engine/build/loadforge /app/loadforge
+
+EXPOSE 9090
+ENTRYPOINT ["/app/loadforge"]

@@ -1,1083 +1,929 @@
-# LoadForge — Building a Distributed Load Testing Platform From Scratch
+# LoadForge: From Scratch
+A Complete Guide to Systems Programming, Networking, and Distributed Systems
 
-> **What this book is:** A complete, from-zero technical guide to building a distributed HTTP load-testing and performance-analysis platform. It covers the theory, design, implementation, testing, and deployment of every component — from raw TCP sockets to a distributed worker fleet with real-time dashboards.
->
-> **Who this book is for:** A developer who knows basic C++, basic Python, basic web development, and wants to deeply understand systems programming, computer networking, concurrency, distributed systems, and performance engineering by building something real.
->
-> **How to read it:** Start from Chapter 1. Do not skip chapters. Do not skip exercises. Every concept taught here is used later in the project. If you skip a concept, you will not understand the code that depends on it.
+Welcome to the definitive guide on building LoadForge, a high-performance distributed load testing platform built from the ground up. This book is designed to teach you systems programming, computer networking, concurrency, distributed systems, and performance engineering by guiding you through a real-world project. We assume you know basic C++, basic Python, and basic web development. We do NOT assume you know OS internals, networking, concurrency, or distributed systems. We will teach you all of that here.
 
 ---
 
-# Part I — Understanding the Problem
+## Part I — Understanding the Problem
 
----
+### Chapter 1: What Are We Building?
+**The one-sentence answer:** We are building a distributed load testing system that can generate millions of requests per second against a target server, precisely measuring latency percentiles and throughput, and displaying this data in real-time on a web dashboard.
 
-## Chapter 1: What Are We Building?
+**The complete pipeline:** 
+1. **User** configures a load test (Target URL, RPS, Duration) via a React web interface.
+2. **Controller (Node.js)** receives the configuration and stores it in PostgreSQL.
+3. **Controller** broadcasts instructions via WebSockets/RPC to a fleet of worker nodes.
+4. **Workers (C++ Engine)** parse the instructions, ramp up connections to the target server, and begin firing HTTP requests at precisely the requested rate.
+5. **Workers** collect microsecond-precision latency data into high-performance atomic histograms.
+6. **Workers** periodically flush these aggregated metrics back to the Controller.
+7. **Controller** merges the metrics from all workers and streams the global aggregates via WebSockets to the React frontend.
+8. **React Frontend** renders real-time charts (P50, P90, P99, RPS).
 
-### The One-Sentence Answer
+**Load generator vs target server:** 
+- The *Target Server* is the application you want to test (e.g., your startup's new API). 
+- The *Load Generator* (our C++ engine) is the tool applying pressure to the target server to see how it behaves under stress.
 
-We are building a tool that generates controlled HTTP traffic, sends it at a target server, and measures how the server performs under that load.
-
-That's it. Everything else in this project — the C++ engine, the distributed workers, the real-time dashboard, the metrics pipeline — exists to make that one sentence work reliably, accurately, and at scale.
-
-### But Why Do I Need a Tool for This?
-
-Imagine you have built an API. Maybe it's an e-commerce backend, a social media feed, or a payment service. You tested it with Postman. It works. You send a request, you get a response. Ship it.
-
-Then 10,000 users arrive.
-
-Suddenly:
-- Requests that took 50 milliseconds now take 3 seconds.
-- Some requests fail entirely with timeout errors.
-- The database runs out of connections.
-- The server's CPU hits 100%.
-- Memory usage climbs until the process crashes.
-- Users see blank pages and error messages.
-
-**Why didn't you catch this during development?**
-
-Because during development, you were one user. One request at a time. The server had essentially zero load. Everything was fast.
-
-The problem only appears when the server is under **concurrent load** — many requests arriving at the same time, competing for the same resources (CPU, memory, database connections, network bandwidth, disk I/O).
-
-**Load testing** is the practice of deliberately generating this kind of concurrent traffic *before* real users arrive, so you can find and fix these problems in a controlled environment.
-
-### What Does Our Tool Actually Do?
-
-Here is the complete pipeline of what LoadForge does during a load test:
-
-```
-Step 1: You configure a test
-   - Target URL: https://api.myapp.com/users
-   - Method: GET
-   - Concurrency: 100 (simulate 100 simultaneous users)
-   - Duration: 60 seconds
-   - Rate: 1000 requests/second
-
-Step 2: LoadForge generates HTTP traffic
-   - It creates network connections to the target server
-   - It sends HTTP requests at the configured rate
-   - It does this from multiple concurrent workers
-
-Step 3: LoadForge measures everything
-   - For EVERY request, it records:
-     - When the request was sent
-     - When the first byte of the response arrived
-     - When the last byte of the response arrived
-     - The HTTP status code (200, 404, 500, etc.)
-     - The response size in bytes
-     - Whether the request succeeded or failed
-     - If it failed, why (timeout, connection refused, etc.)
-
-Step 4: LoadForge aggregates metrics
-   - It calculates:
-     - Actual requests per second (RPS)
-     - Latency percentiles (P50, P95, P99)
-     - Error rate
-     - Throughput in bytes/second
-     - Number of active connections
-     - Distribution of status codes
-
-Step 5: LoadForge reports results
-   - Real-time graphs showing metrics as the test runs
-   - Final report with summary statistics
-   - Historical storage so you can compare tests over time
-```
-
-### The Two Machines
-
-This is a critical distinction that many beginners miss:
-
-**There are two separate systems involved in every load test:**
-
-```
- ┌──────────────────┐                    ┌──────────────────┐
- │                  │   HTTP requests    │                  │
- │   LOAD GENERATOR │ ================► │  TARGET SERVER   │
- │   (LoadForge)    │                    │  (Your API)      │
- │                  │ ◄================ │                  │
- │                  │   HTTP responses   │                  │
- └──────────────────┘                    └──────────────────┘
-       OUR CODE                            THEIR CODE
-   We control this.                    We are testing this.
-```
-
-**The Load Generator (LoadForge)** is the tool we are building. It generates fake traffic. It is the client. It pretends to be thousands of users.
-
-**The Target Server** is the system being tested. It is someone else's API, or your own API. It is the server. It receives the traffic and tries to handle it.
-
-These are completely independent. They may run on different machines, different networks, different continents. Our job is to build the left side — the load generator — and make it powerful, accurate, and reliable enough to stress-test the right side.
-
-### Why Not Just Use `curl` in a Loop?
-
-You might think: "Can't I just write a bash script that calls `curl` in a loop?"
-
+**Why not `curl` in a loop?**
+You might wonder why we can't just run a shell script:
 ```bash
-# Naive approach — DO NOT use this for real load testing
-for i in $(seq 1 10000); do
-    curl -s http://api.myapp.com/users > /dev/null &
+while true; do
+  curl http://target-server.com/api &
 done
 ```
-
-This approach has several fundamental problems:
-
-1. **No rate control.** You cannot control exactly how many requests per second are sent. The loop fires requests as fast as the shell can fork processes.
-
-2. **Process overhead.** Each `curl` invocation spawns a new process. Creating 10,000 processes is extremely expensive. The operating system spends more time managing processes than sending requests. Your load generator becomes the bottleneck, not the target server.
-
-3. **No connection reuse.** Each `curl` opens a new TCP connection, performs the request, and closes the connection. Real users' browsers reuse connections (HTTP keep-alive). Your test doesn't simulate real behavior.
-
-4. **No accurate timing.** When did each request start? When did it end? What was the latency? You have no measurements.
-
-5. **No concurrency control.** You launched 10,000 background processes. How many are running concurrently? You don't know. It depends on the OS scheduler.
-
-6. **No metrics.** What was the P99 latency? What was the error rate? What was the actual RPS achieved? You don't know.
-
-7. **No reproducibility.** Run the same script twice. You'll get different results because there's no controlled scheduling.
-
-**This is exactly why we need a proper load testing tool.** A well-engineered load generator solves all of these problems:
-
-| Problem | Our Solution |
-|---------|-------------|
-| Rate control | Precise request scheduler with token-bucket or leaky-bucket algorithm |
-| Process overhead | Thread pool with connection reuse, not one process per request |
-| Connection reuse | HTTP keep-alive with connection pooling |
-| Accurate timing | High-resolution clock measurements at every stage of the request |
-| Concurrency control | Explicit concurrency parameter, controlled with semaphores |
-| Metrics | HDR histograms, percentile calculations, real-time aggregation |
-| Reproducibility | Deterministic scheduling with configurable parameters |
-
-You don't know what most of these words mean yet. That's fine. You will, because we're going to build every one of them.
-
----
-
-## Chapter 2: Why Does Load Testing Exist?
-
-### The Fundamental Problem: Systems Behave Differently Under Load
-
-Every server application has **resources** it depends on:
-
-| Resource | What it does | What happens when it runs out |
-|----------|-------------|-------------------------------|
-| CPU | Processes instructions | Requests slow down, queue up |
-| Memory (RAM) | Stores working data | Process crashes (OOM kill) |
-| Network bandwidth | Moves data between machines | Requests queue, latency spikes |
-| Disk I/O | Reads/writes persistent data | Database queries slow down |
-| Database connections | Communicates with database | New requests can't reach the DB |
-| File descriptors | Represents open files/sockets | Can't accept new connections |
-| Thread pool | Executes concurrent work | Requests queue waiting for a thread |
-
-When your server has one user, none of these are even close to their limits. Everything is fast.
-
-When your server has 100,000 concurrent users, some of these resources will hit their limits. The question is: **which ones?**
-
-Load testing answers this question *before* your users answer it for you during a production outage.
-
-### Real-World Consequences of Not Load Testing
-
-These are not hypothetical scenarios. They happen in production at real companies:
-
-**Scenario 1: The Black Friday Crash**
-An e-commerce site launches a holiday sale. Traffic spikes to 50x normal. The application server's thread pool is configured for 200 threads. Each thread holds a database connection. The database is configured for 200 max connections. At 200 concurrent requests, the database connection pool is full. Request #201 waits. Request #202 waits. The wait queue grows. Timeouts cascade. The entire site goes down. Revenue loss: millions.
-
-A load test at 50x traffic would have revealed the database connection limit weeks before the sale.
-
-**Scenario 2: The Slow Memory Leak**
-A web application allocates 2KB of memory per request but doesn't free it properly. At 100 requests/second, that's 200KB/second. The server has 8GB of RAM. It takes about 11 hours to run out of memory. The process gets killed by the Linux OOM (Out Of Memory) killer. The server restarts. It happens again 11 hours later.
-
-A sustained load test at 100 RPS for 12 hours would have caught this.
-
-**Scenario 3: The P99 Surprise**
-An API responds in 20ms on average. Looks great. But 1% of requests take 5 seconds. That's the P99 latency (the 99th percentile — we'll explain percentiles thoroughly later). If you have 10,000 requests/second, that means 100 requests per second are taking 5 seconds. Those are 100 real users staring at a loading spinner. Your average looked fine. Your tail latency is terrible.
-
-A load test with proper percentile measurement would have revealed this immediately.
-
-### The Types of Load Testing
-
-Not all load tests are the same. Here are the standard types, and we will eventually support all of them:
-
-| Type | Purpose | Example |
-|------|---------|---------|
-| **Smoke test** | Verify the system works at minimal load | 1 user, 10 requests |
-| **Load test** | Verify behavior at expected traffic | 1000 concurrent users, 30 minutes |
-| **Stress test** | Find the breaking point | Ramp from 100 to 10,000 users |
-| **Spike test** | Test sudden traffic surges | Jump from 100 to 5,000 users instantly |
-| **Soak test** (endurance) | Find slow leaks and degradation | 500 users for 24 hours |
-| **Breakpoint test** | Find the exact max capacity | Increment by 50 users/min until failure |
-
-Each of these requires different features from our engine:
-- **Ramp-up/ramp-down** (gradually increasing/decreasing load)
-- **Sustained fixed rate** (constant load over time)
-- **Spike generation** (instant jump in traffic)
-- **Long duration** (hours or days of continuous testing)
-
-### What Existing Tools Do
-
-You should know what tools exist in this space, because you should understand what we're building and why:
-
-| Tool | Language | Model | Notes |
-|------|----------|-------|-------|
-| **Apache Bench (ab)** | C | Simple CLI | Very basic, single URL, no scripting |
-| **wrk** | C | Multi-threaded | Fast but limited features, single URL |
-| **wrk2** | C | Coordinated omission fix | Fixes a critical measurement bug in wrk |
-| **k6** | Go | JavaScript scripting | Modern, scriptable, cloud-ready |
-| **Gatling** | Scala/JVM | Scenario-based | Powerful DSL, good reports |
-| **Locust** | Python | User-based | Easy to script, but Python limits throughput |
-| **JMeter** | Java | GUI-based | Enterprise-focused, complex, heavy |
-| **Vegeta** | Go | Constant rate | Good rate control, CLI-focused |
-| **hey** | Go | Simple CLI | Replacement for ab, simple |
-
-We are building something in the spirit of **wrk2 + k6 + Vegeta**: a high-performance C++ engine (like wrk2) with the distributed architecture and dashboard of k6, and the precise rate control of Vegeta.
-
-### What Makes Our Project Different (as a Learning Exercise)
-
-We are not trying to compete with k6 or Gatling. We are building this to **learn**. The difference is:
-
-1. **We will understand every layer.** Tools like k6 use Go's `net/http` library. We will build our own connection management on top of raw sockets.
-
-2. **We will understand the measurements.** Most tools give you P99 as a number. We will build the histogram data structure that calculates it.
-
-3. **We will understand the distribution.** Most tools have a CLI flag for "distributed mode." We will build the worker registration, task distribution, and metric aggregation ourselves.
-
-4. **We will understand the bottlenecks.** Most tools don't tell you when the load generator itself is the bottleneck. We will detect this.
-
----
-
-## Chapter 3: What Happens During a Load Test?
-
-Let's trace exactly what happens, step by step, when you run a load test. This is the complete data flow. You won't understand every detail yet — that's expected. This chapter is a map. We'll explore each territory in later chapters.
-
-### Phase 1: Configuration
-
-The user (you) tells LoadForge what to do:
-
-```
-Target:       https://api.myapp.com/users
-Method:       GET
-Headers:      Authorization: Bearer <token>
-Rate:         500 requests/second
-Concurrency:  50 simultaneous connections
-Duration:     60 seconds
-Ramp-up:      10 seconds (gradually increase from 0 to 500 RPS)
-Timeout:      5 seconds per request
-```
-
-This configuration is sent to the **Controller**.
-
-### Phase 2: Test Setup
-
-The Controller:
-1. Validates the configuration (is the URL valid? Is the rate reasonable?).
-2. Decides how to distribute the work (if we have 3 workers, each generates ~167 RPS).
-3. Sends the test configuration to each **Worker** (C++ engine).
-4. Records the test in the database (PostgreSQL).
-5. Tells the dashboard "a test is starting."
-
-### Phase 3: Workers Generate Traffic
-
-Each Worker (C++ engine):
-1. Opens TCP connections to the target server.
-2. Starts a high-precision timer.
-3. Begins sending HTTP requests at the assigned rate.
-4. For each request, records timestamps at multiple points:
-   - `t0`: Request scheduled
-   - `t1`: Connection acquired (from pool or newly created)
-   - `t2`: Request bytes sent
-   - `t3`: First response byte received
-   - `t4`: Last response byte received
-5. Calculates latency for each request: `t4 - t0` (total) and `t3 - t2` (server processing time).
-6. Records success/failure and status code.
-7. Stores metrics in an efficient in-memory data structure (histogram).
-
-### Phase 4: Metrics Flow
-
-```
-                     Worker 1           Worker 2           Worker 3
-                        │                   │                   │
-                        ▼                   ▼                   ▼
-              ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-              │ Local histogram │ │ Local histogram │ │ Local histogram │
-              │ Local counters  │ │ Local counters  │ │ Local counters  │
-              └────────┬────────┘ └────────┬────────┘ └────────┬────────┘
-                       │                   │                   │
-                       │    Every 1 sec    │                   │
-                       └───────────────────┼───────────────────┘
-                                           │
-                                           ▼
-                                    ┌─────────────┐
-                                    │  Controller  │
-                                    │  (Node.js)   │
-                                    └──────┬──────┘
-                                           │
-                              ┌────────────┼────────────┐
-                              │            │            │
-                              ▼            ▼            ▼
-                         Dashboard    PostgreSQL    Prometheus
-```
-
-Each worker periodically (every 1 second) sends a **compact metrics snapshot** to the controller. Not individual request data — aggregated data: total requests, error count, latency histogram, active connections.
-
-**Why not send individual request data?**
-
-At 1,000 RPS per worker with 3 workers, that's 3,000 individual request records per second. Over a 60-second test: 180,000 records. Over a 30-minute stress test: 5,400,000 records. Sending and storing each one is wasteful and would itself become a bottleneck.
-
-Instead, each worker maintains a histogram (a data structure that efficiently captures the distribution of latencies) and sends the histogram + counters once per second. The controller merges histograms from all workers into a global view.
-
-### Phase 5: Real-Time Dashboard
-
-While the test runs, the dashboard shows:
-- Current RPS (actual vs. target)
-- Latency graph (P50, P95, P99 over time)
-- Error rate
-- Active connections per worker
-- Worker health status
-
-This data flows from Controller → Dashboard via WebSockets (a persistent bi-directional connection; we'll cover this later).
-
-### Phase 6: Test Completion
-
-When the duration expires (or the user stops the test):
-1. The Controller tells all workers to stop.
-2. Workers drain remaining in-flight requests.
-3. Workers send final metrics.
-4. The Controller computes final summary statistics.
-5. The Controller stores the complete test result in PostgreSQL.
-6. The Dashboard shows the final report.
-
-### Phase 7: Analysis
-
-The final report contains:
-- Total requests sent
-- Total requests succeeded
-- Total requests failed
-- Actual sustained RPS
-- Latency: min, max, mean, median (P50), P90, P95, P99, P99.9
-- Throughput: bytes sent, bytes received
-- Error breakdown: by type (timeout, connection refused, HTTP 5xx)
-- Timeline: RPS and latency over time (per-second buckets)
-
----
-
-## Chapter 4: The Complete Architecture
-
-### Evolution, Not Big Bang
-
-We will NOT build the final architecture in one step. The system evolves through stages:
-
-```
-Stage 1: Single-threaded, single-request C++ program
-            │
-            ▼
-Stage 2: Multi-request, sequential
-            │
-            ▼
-Stage 3: Concurrent requests (multi-threaded)
-            │
-            ▼
-Stage 4: Connection pooling + reuse
-            │
-            ▼
-Stage 5: Non-blocking I/O + event loop
-            │
-            ▼
-Stage 6: Rate-controlled request scheduling
-            │
-            ▼
-Stage 7: Metrics collection + histograms
-            │
-            ▼
-Stage 8: Node.js controller + API
-            │
-            ▼
-Stage 9: React dashboard
-            │
-            ▼
-Stage 10: Distributed workers (gRPC)
-            │
-            ▼
-Stage 11: PostgreSQL persistence
-            │
-            ▼
-Stage 12: Prometheus + Grafana
-            │
-            ▼
-Stage 13: Docker + deployment
-```
-
-Each stage builds on the previous one. Each stage introduces new concepts. Each stage has a Learning Gate.
-
-### The Final Architecture Diagram
-
-When complete, the system looks like this:
-
-```
-                          ┌─────────────────────┐
-                          │    Developer / User  │
-                          └──────────┬──────────┘
-                                     │
-                        ┌────────────┴────────────┐
-                        │                         │
-                        ▼                         ▼
-                   ┌─────────┐              ┌──────────┐
-                   │   CLI   │              │ Web UI   │
-                   │         │              │ (React)  │
-                   └────┬────┘              └────┬─────┘
-                        │                        │
-                        └───────────┬────────────┘
-                                    │
-                                    ▼
-                          ┌──────────────────┐
-                          │   CONTROLLER     │
-                          │   (Node.js/TS)   │
-                          │                  │
-                          │  • API server    │
-                          │  • Test manager  │
-                          │  • Worker mgr    │
-                          │  • Metric aggr.  │
-                          └────────┬─────────┘
-                                   │
-                    ┌──────────────┼──────────────┐
-                    │     gRPC    │    gRPC      │
-                    ▼              ▼              ▼
-              ┌──────────┐  ┌──────────┐  ┌──────────┐
-              │ WORKER 1 │  │ WORKER 2 │  │ WORKER 3 │
-              │ (C++)    │  │ (C++)    │  │ (C++)    │
-              │          │  │          │  │          │
-              │ • HTTP   │  │ • HTTP   │  │ • HTTP   │
-              │   engine │  │   engine │  │   engine │
-              │ • Conn   │  │ • Conn   │  │ • Conn   │
-              │   pool   │  │   pool   │  │   pool   │
-              │ • Metrics│  │ • Metrics│  │ • Metrics│
-              └─────┬────┘  └─────┬────┘  └─────┬────┘
-                    │             │             │
-                    └─────────────┼─────────────┘
-                                  │
-                           HTTP Traffic
-                                  │
-                                  ▼
-                        ┌──────────────────┐
-                        │  TARGET SERVER   │
-                        │  (System Under   │
-                        │   Test)          │
-                        └──────────────────┘
-
-              ─── Data Storage & Monitoring ───
-
-              Controller ──► PostgreSQL (test results)
-              Controller ──► Prometheus (live metrics)
-              Prometheus ──► Grafana (visualization)
-              Controller ──► Dashboard (WebSocket, real-time)
-```
-
-### The Two Planes
-
-A key architectural concept: the system has two distinct "planes" of communication.
-
-**Control Plane** — the path that commands and configuration travel:
-```
-User → Controller → Workers: "Start test with this config"
-User → Controller → Workers: "Stop the test"
-Workers → Controller: "I'm alive" (heartbeat)
-Workers → Controller: "I finished"
-```
-
-**Data Plane** — the path that actual load-test traffic and metrics travel:
-```
-Workers → Target Server: HTTP requests (the actual load)
-Target Server → Workers: HTTP responses
-Workers → Controller: Metric snapshots (aggregated data)
-Controller → Dashboard: Real-time metrics (via WebSocket)
-Controller → PostgreSQL: Historical data
-```
-
-These are separated because they have very different requirements:
-
-| Property | Control Plane | Data Plane |
-|----------|--------------|------------|
-| Volume | Low (a few messages per test) | High (thousands of requests/sec) |
-| Latency requirement | Not critical (ms is fine) | Critical (must be measured accurately) |
-| Reliability | Must be reliable (can't lose commands) | Tolerates some loss (one missed metric snapshot is okay) |
-| Protocol | gRPC (eventually) | HTTP (for traffic) + custom metrics protocol |
-
-This separation is a recurring pattern in distributed systems. Kubernetes has a control plane and a data plane. Networking hardware has a control plane and a data plane. CDNs have a control plane and a data plane. Understanding this pattern will serve you well beyond this project.
-
----
-
-## Chapter 5: Control Plane vs Data Plane — A Deeper Look
-
-### Why Separate Them?
-
-Consider what happens if we sent control commands (like "stop the test") over the same channel as the load traffic. The load traffic might be so heavy that it delays or drops the stop command. The test keeps running when you told it to stop.
-
-Or consider the reverse: if metrics data flows through the control channel, a burst of metrics could delay a heartbeat, making the controller think a worker is dead.
-
-Separation means:
-1. **Control messages are never delayed by data volume.** The "stop" command goes through a dedicated, low-traffic channel.
-2. **Data volume doesn't affect system stability.** Even if metrics are temporarily delayed, the system doesn't think workers have failed.
-3. **Each plane can be optimized independently.** The control plane can use reliable, ordered delivery (TCP with acknowledgments). The data plane can be optimized for throughput (compact binary encoding, batching).
-
-### Analogy
-
-Think of an airport:
-
-- **Control plane:** The radio communication between the control tower and pilots. Low volume, extremely important, must be reliable. "Flight 427, you are cleared for takeoff."
-- **Data plane:** The actual movement of planes, passengers, and cargo. High volume, high throughput. The physical runway and airspace.
-
-You would never transmit air traffic control commands by writing them on a piece of luggage and hoping it gets to the right plane. The channels are separated because they have fundamentally different requirements.
-
-### How This Applies to Our Architecture
+1. **Process overhead:** Spawning a new `curl` process for every request is incredibly expensive. Your OS will spend more CPU creating processes than sending network packets.
+2. **No precision scheduling:** You cannot accurately schedule 10,000 requests per second with shell sleep commands.
+3. **Coordinated omission:** Simple loops block when the target server slows down, artificially lowering the measured latency because the load generator is "waiting" rather than recording the delay.
+4. **No global aggregation:** You cannot easily collect P99 latency percentiles across multiple machines.
+
+**Comparison table with existing tools:**
+
+| Feature | curl in loop | Apache Benchmark (ab) | wrk / wrk2 | LoadForge |
+|---|---|---|---|---|
+| Concurrent Connections | No | Yes | Yes | Yes |
+| Distributed Fleet | No | No | No | Yes |
+| Real-time Web UI | No | No | No | Yes |
+| Solves Coordinated Omission | No | No | wrk2 only | Yes |
+| Core Language | C | C | C | C++ / Node.js |
+
+### Chapter 2: Why Does Load Testing Exist?
+**Systems behave differently under load.** A web server that responds in 10ms when a single user is clicking around might take 5000ms or crash completely when 10,000 users arrive simultaneously. 
+
+**Resource exhaustion scenarios:**
+- **CPU:** The server spends all its cycles processing requests, leaving no time to handle new incoming TCP connections.
+- **Memory:** Each request allocates objects. Under heavy load, the garbage collector thrashes, or the OS runs out of RAM and invokes the OOM (Out Of Memory) Killer.
+- **File Descriptors:** Every TCP connection requires a file descriptor. Linux typically caps this at 1024 by default. If 1025 users connect, the server refuses the connection.
+- **Network Bandwidth:** The physical network pipe fills up, causing packet drops and TCP retransmissions, leading to massive latency spikes.
+
+**Types of load tests:**
+- **Smoke Test:** Very low load just to verify the system can handle any traffic at all.
+- **Load Test:** Sustained, expected peak load to ensure SLAs (Service Level Agreements) are met.
+- **Stress Test:** Pushing the system beyond expected peak until it breaks, to identify the weakest link.
+- **Spike Test:** A sudden, massive surge in traffic (like a Black Friday sale or going viral).
+- **Soak Test:** Sustained moderate load over a long period (e.g., 24 hours) to find memory leaks.
+- **Breakpoint Test:** Slowly increasing load indefinitely until the system collapses to find its absolute limit.
+
+### Chapter 3: What Happens During a Load Test?
+A load test follows a precise 7-phase lifecycle:
+
+1. **Registration:** Worker nodes boot up and ping the Controller: "I am worker node 1, I am alive and ready."
+2. **Test Dispatch:** The user initiates a test. The Controller computes the load distribution. If the user wants 10,000 RPS and there are 5 workers, the Controller tells each worker: "Generate 2000 RPS for 60 seconds against http://api.example.com."
+3. **Connection Warm-up:** Workers open TCP connections to the target server. Handshakes take time; doing this before the test starts ensures we measure the application, not TCP setup time.
+4. **Ramp-up:** Traffic gradually increases. Hitting a server with 10,000 RPS instantly causes artificial failures (e.g., cold caches, unloaded JIT compilers).
+5. **Steady State:** The engine enforces the precise RPS using a Token Bucket rate limiter.
+6. **Metrics Collection:** Every request's latency is recorded in a local atomic histogram. Every 1 second, a background thread flushes this histogram to the Controller.
+7. **Teardown:** Connections are closed, final metrics are saved, and workers return to the idle pool.
+
+**Why we aggregate not store individual requests:**
+At 1,000,000 RPS, generating a 60-second test produces 60 million data points. Storing 60 million 8-byte integers requires hundreds of megabytes per test, choking the network and database. Instead, we use **Histograms**. A histogram counts *how many* requests fell into specific latency buckets (e.g., 1200 requests took 10-11ms). This compresses millions of data points into a fixed-size array of integers.
+
+### Chapter 4: The Complete Architecture
+Our system evolves through 13 stages:
+1. `Hello World` socket connection.
+2. Sequential HTTP request loop.
+3. Thread-per-request model (naive concurrency).
+4. Fixed Thread Pool pattern.
+5. Non-blocking I/O with `epoll`/`poll`.
+6. Connection pooling and Keep-Alive.
+7. Token Bucket Rate Limiting.
+8. High-Dynamic Range (HDR) Histograms.
+9. Node.js Controller API.
+10. WebSocket broadcasting.
+11. Distributed worker orchestration.
+12. React Dashboard.
+13. Docker & Docker Compose deployment.
+
+**Component responsibilities:**
+- **C++ Engine:** Maximizes network I/O, precisely schedules requests, and collects microsecond-level timing.
+- **Node.js Controller:** Manages state, persists data to PostgreSQL, and aggregates math (merging histograms).
+- **PostgreSQL:** Provides reliable, ACID-compliant storage for test configs and results.
+- **React UI:** Provides an intuitive graphical interface for humans.
+
+### Chapter 5: Control Plane vs Data Plane
+A crucial concept in distributed systems is the separation of planes.
+
+**The Airport Analogy:**
+- **Control Plane:** The Air Traffic Control tower. It doesn't carry passengers, but it directs where planes go, when they take off, and monitors the overall system.
+- **Data Plane:** The planes themselves. They do the heavy lifting of carrying passengers from A to B.
 
 In LoadForge:
+- **Control Plane (Node.js Controller):** Carries low-volume, high-value messages: "Start Test X", "Worker Y is Dead", "Here is your RPS target".
+- **Data Plane (C++ Engine & Network):** Carries high-volume, repetitive data: The actual HTTP GET requests to the target server, and the stream of latency metrics.
 
-**Control Plane messages:**
-- Controller → Worker: "Here is your test configuration"
-- Controller → Worker: "Start generating load"
-- Controller → Worker: "Stop the test"
-- Controller → Worker: "Report your status"
-- Worker → Controller: "I'm registering myself as available"
-- Worker → Controller: "I'm healthy" (heartbeat)
-- Worker → Controller: "I encountered a fatal error"
-
-**Data Plane flows:**
-- Worker → Target: HTTP request (GET /users)
-- Target → Worker: HTTP response (200 OK, body: [...])
-- Worker → Controller: Metric snapshot (1-second aggregation)
-- Controller → Dashboard: Live metric update (WebSocket)
-- Controller → PostgreSQL: Test result batch write
-- Worker → Prometheus: Prometheus scrape (metrics endpoint)
+Separating these ensures that a massive data plane traffic spike (the load test itself) doesn't crash the control plane (the system managing the test).
 
 ---
 
-## Chapter 6: The Life of a Single HTTP Request
+## Part II — Foundations
 
-Before we can build a load generator, we need to understand what happens when a single HTTP request travels from our tool to the target server and back.
+Before we write code, we must understand the operating system primitives that make high-performance software possible.
 
-This chapter gives you the **conceptual overview**. We will go deeper into each layer (TCP, sockets, HTTP) in later chapters when we implement them.
+### Chapter 6: Processes
+**What a process is:**
+A program is just a file on disk (like `loadforge.exe`). When you run it, the OS loads it into RAM and creates a **Process**. A process is an executing instance of a program. It provides an illusion: the process thinks it has the entire CPU and all the RAM to itself.
 
-### The Complete Journey
-
-When our load generator sends one HTTP request, here's what happens:
-
-```
-┌─ LoadForge (our code) ────────────────────────────────────────────┐
-│                                                                    │
-│  1. Our code decides to send a request                            │
-│  2. We construct an HTTP message:                                 │
-│     GET /users HTTP/1.1                                           │
-│     Host: api.myapp.com                                           │
-│     Connection: keep-alive                                        │
-│                                                                    │
-│  3. We write this message to a SOCKET                             │
-│     (a socket is our program's doorway to the network)            │
-│                                                                    │
-└────────────────────────────┬───────────────────────────────────────┘
-                             │
-                             ▼
-┌─ Operating System ─────────────────────────────────────────────────┐
-│                                                                    │
-│  4. The OS kernel takes our message                               │
-│  5. Wraps it in a TCP segment (adds sequence numbers, checksums)  │
-│  6. Wraps THAT in an IP packet (adds source/destination IP)       │
-│  7. Wraps THAT in an Ethernet frame (for local network delivery)  │
-│  8. Sends it out through the network interface (NIC)              │
-│                                                                    │
-└────────────────────────────┬───────────────────────────────────────┘
-                             │
-                             ▼
-┌─ Network ──────────────────────────────────────────────────────────┐
-│                                                                    │
-│  9. The packet travels through:                                   │
-│     - Your local network switch/router                            │
-│     - Your ISP's network                                          │
-│     - Internet backbone routers                                   │
-│     - Target's ISP / cloud provider network                       │
-│     - Target's datacenter network                                 │
-│  10. This may take 1ms (same datacenter) to 200ms (cross-globe)  │
-│                                                                    │
-└────────────────────────────┬───────────────────────────────────────┘
-                             │
-                             ▼
-┌─ Target Server ────────────────────────────────────────────────────┐
-│                                                                    │
-│  11. Target's NIC receives the packet                             │
-│  12. Target's kernel reassembles the TCP data                     │
-│  13. The web server process reads the HTTP request from its socket│
-│  14. The application processes the request                        │
-│      (queries DB, runs business logic, etc.)                      │
-│  15. The application constructs an HTTP response:                 │
-│      HTTP/1.1 200 OK                                              │
-│      Content-Type: application/json                               │
-│      Content-Length: 42                                            │
-│                                                                    │
-│      {"users": [{"id": 1, "name": "Alice"}]}                     │
-│  16. The response travels back through the same layers            │
-│                                                                    │
-└────────────────────────────┬───────────────────────────────────────┘
-                             │
-                             ▼
-┌─ Back at LoadForge ────────────────────────────────────────────────┐
-│                                                                    │
-│  17. Our kernel receives the response packets                     │
-│  18. Our kernel reassembles the TCP data                          │
-│  19. Our code reads the response from the socket                  │
-│  20. We parse the HTTP response                                   │
-│  21. We record the latency: time(step 20) - time(step 1)         │
-│  22. We record the status code, response size, success/failure    │
-│  23. We update our metrics histogram                              │
-│                                                                    │
-└────────────────────────────────────────────────────────────────────┘
+**Process memory layout:**
+```text
+High Memory
++------------------+
+|      Stack       | <- Local variables, function call frames. Grows down.
+|        |         |
+|        v         |
+|                  |
+|        ^         |
+|        |         |
+|      Heap        | <- Dynamic memory (new/malloc). Grows up.
++------------------+
+|   Data (BSS)     | <- Uninitialized global variables.
++------------------+
+|   Data (Init)    | <- Initialized global variables.
++------------------+
+|   Text (Code)    | <- The actual machine instructions. Read-only.
++------------------+
+Low Memory
 ```
 
-### The Layers
+**Process creation (fork):**
+In UNIX, processes are created using the `fork()` system call. `fork()` creates an exact duplicate of the calling process. The OS manages these processes, isolating their memory so one process cannot crash another.
 
-Notice how the data gets wrapped in layers:
+**Why processes matter for our project:**
+The LoadForge Controller and Workers are separate processes. If a Worker crashes due to a segfault, the Controller keeps running. This fault isolation is vital for reliability.
 
-```
-Application layer:  HTTP message (GET /users HTTP/1.1...)
-                        │
-                        ▼
-Transport layer:    TCP segment (sequence number, checksums, ports)
-                        │
-                        ▼
-Network layer:      IP packet (source IP, destination IP)
-                        │
-                        ▼
-Link layer:         Ethernet frame (MAC addresses)
-                        │
-                        ▼
-Physical:           Electrical signals / light on the wire
-```
+### Chapter 7: Threads
+**What a thread is:**
+A thread is a unit of execution *within* a process. While processes have their own memory space, threads **share** the memory space of their parent process.
 
-This is the **TCP/IP network model**. Each layer adds its own header information around the data from the layer above. This is called **encapsulation**.
+**Thread vs Process:**
+- **Process:** Heavyweight, isolated, independent memory, slower to create, communicates via IPC (Inter-Process Communication like sockets or pipes).
+- **Thread:** Lightweight, shared memory, faster to create, communicates by simply reading/writing shared variables.
 
-When the target server receives the data, it strips off each layer in reverse, like opening nested envelopes.
+**Shared memory model:**
+Because threads share the Heap and Data segments, Thread A can allocate memory and pass a pointer to Thread B. However, every thread has its own **Stack** for local variables.
 
-You don't need to memorize this stack right now. You need to know it **exists**, because later we will work directly with the TCP layer (via sockets) and the HTTP layer (constructing request messages).
+**Thread creation in C++:**
+```cpp
+#include <iostream>
+#include <thread>
 
-### Where We Measure
+void worker_function(int id) {
+    std::cout << "Thread " << id << " is running." << std::endl;
+}
 
-As load-test engineers, we care about time at specific points:
-
-```
-t0 ──► Request scheduled (our scheduler decides it's time to send)
-t1 ──► Connection acquired (from pool, or new TCP handshake completed)
-t2 ──► Request bytes fully sent to the socket
-t3 ──► First response byte received from the socket
-t4 ──► Last response byte received, response fully parsed
-
-Total latency     = t4 - t0  (what the "user" experiences)
-Connection time   = t1 - t0  (time to get a connection)
-Send time         = t2 - t1  (time to transmit the request)
-Server time (TTFB)= t3 - t2  (Time To First Byte — server processing)
-Download time     = t4 - t3  (time to receive the full response)
+int main() {
+    std::thread t1(worker_function, 1);
+    std::thread t2(worker_function, 2);
+    
+    t1.join(); // Wait for t1 to finish
+    t2.join(); // Wait for t2 to finish
+    return 0;
+}
 ```
 
-Each of these tells us something different about where time is being spent. If `connection time` is high, the target server is slow to accept connections. If `server time` is high, the application is slow to process requests. If `download time` is high, the response is large or the network is slow.
-
----
-
-## Chapter 7: What Metrics Do We Collect?
-
-Before we write any code, we need to understand **what we're measuring**. Otherwise, we'll build a load generator that sends traffic but tells us nothing useful.
-
-### The Five Fundamental Metrics
-
-Every load test revolves around five core metrics:
-
-#### 1. Throughput (Requests Per Second — RPS)
-
-**What it is:** How many requests the target server can handle per unit of time.
-
-**Why it matters:** This is the server's capacity. If your target handles 1,000 RPS and your expected peak traffic is 800 RPS, you have headroom. If expected peak is 1,200 RPS, you have a problem.
-
-**How we measure it:** Count completed requests per second.
-
-**Subtlety:** "Throughput" can mean RPS (requests/second) or data throughput (bytes/second). We measure both, but when people say "throughput" in load testing, they usually mean RPS.
-
-#### 2. Latency
-
-**What it is:** How long it takes for a single request to complete, from sending to receiving the response.
-
-**Why it matters:** Even if a server handles 10,000 RPS, if each request takes 5 seconds, users are unhappy. Latency directly affects user experience.
-
-**How we measure it:** Record `t4 - t0` (see Chapter 6) for every request.
-
-**Critical warning:** **Average latency is almost useless.** We'll explain why in the next section.
-
-#### 3. Latency Distribution (Percentiles)
-
-**What it is:** Instead of one number (the average), the full distribution of latencies.
-
-**Why it matters:** This is one of the most important concepts in performance engineering. Let me explain with an example.
-
-Suppose you send 100 requests:
-- 95 complete in 50ms
-- 4 complete in 200ms
-- 1 completes in 10,000ms (10 seconds)
-
-**Average latency:** (95×50 + 4×200 + 1×10000) / 100 = (4750 + 800 + 10000) / 100 = 155.5ms
-
-That 155ms average looks acceptable. But **one user waited 10 seconds.** And if you have 10,000 requests per second, that's 100 users per second experiencing 10-second delays.
-
-**Percentiles reveal this:**
-
-| Percentile | Meaning | Value in our example |
-|------------|---------|---------------------|
-| P50 (median) | 50% of requests are faster than this | 50ms |
-| P90 | 90% of requests are faster than this | 50ms |
-| P95 | 95% of requests are faster than this | 50ms |
-| P99 | 99% of requests are faster than this | 200ms |
-| P99.9 | 99.9% of requests are faster than this | 10,000ms |
-| Max | The slowest single request | 10,000ms |
-
-Now the P99.9 of 10,000ms screams that something is very wrong for a small fraction of users. The average hid this. The percentiles revealed it.
-
-**This is why every serious load-testing tool reports percentiles, not averages.**
-
-Our tool will use a **histogram** data structure to efficiently compute percentiles. We'll build this later.
-
-#### 4. Error Rate
-
-**What it is:** The percentage of requests that failed.
-
-**Types of failures we track:**
-
-| Failure Type | What Happened |
-|-------------|---------------|
-| TCP connection refused | Target server isn't accepting connections |
-| TCP connection timeout | Target server is too slow to accept the connection |
-| Request timeout | Target server accepted the connection but didn't respond in time |
-| HTTP 4xx | Client error (bad request, unauthorized, not found) |
-| HTTP 5xx | Server error (internal server error, bad gateway, service unavailable) |
-| Connection reset | Target server abruptly closed the connection |
-| DNS resolution failure | Could not resolve the hostname |
-
-**Why it matters:** Even a 0.1% error rate at 10,000 RPS means 10 errors per second. Over a minute, that's 600 failed requests. Whether that's acceptable depends on the service, but you need to know about it.
-
-#### 5. Concurrency
-
-**What it is:** How many requests are in-flight (sent but not yet completed) at any given moment.
-
-**Why it matters:** If you configure 100 concurrent connections but you observe only 30 are active, your rate is too low (connections are idle between requests). If you observe 100 are always active and requests are queuing, your server can't keep up with the load.
-
-**Relationship to other metrics:**
-
-There is a fundamental relationship called **Little's Law**:
-
-$$L = \lambda \times W$$
-
-Where:
-- $L$ = average number of concurrent requests (concurrency)
-- $\lambda$ = throughput (requests per second)
-- $W$ = average latency (seconds)
-
-Example: If your server handles 500 RPS with an average latency of 200ms:
-
-$$L = 500 \times 0.2 = 100$$
-
-You need approximately 100 concurrent connections to sustain 500 RPS at 200ms latency. If you only open 50 connections, you cannot reach 500 RPS — the connections become the bottleneck.
-
-This relationship will guide our connection pool sizing later.
-
-### Secondary Metrics
-
-Beyond the five fundamentals, we also track:
-
-| Metric | What it tells us |
-|--------|-----------------|
-| Bytes sent | How much request data we're generating |
-| Bytes received | How much response data we're receiving |
-| Connection pool utilization | Are we using our connections efficiently? |
-| Active connections | How many TCP connections are currently open |
-| Queue depth | How many requests are waiting to be sent |
-| Worker CPU usage | Is our load generator becoming the bottleneck? |
-| Worker memory usage | Are we leaking memory? |
-| Status code distribution | Breakdown of 200, 201, 400, 404, 500, 503, etc. |
-
-### Metrics We Track About Ourselves
-
-This is an often-overlooked but critical concept: **we need to monitor our own load generator.**
-
-Why? Because if our load generator's CPU is at 100%, it can't send requests fast enough. The measured latency might include time the request spent waiting in *our* queue, not the server's processing time. We'd blame the target server for latency that was actually our bottleneck.
-
-This is related to a well-known measurement problem called **coordinated omission**, which we will address later. For now, just know: **the load generator must monitor itself** and warn you when it might be affecting the results.
-
----
-
-# Learning Gate #1
-
-## Before Writing the First Line of Code
-
-We've covered a lot of conceptual ground. Before we write any code, you need to solidify your understanding of these foundational concepts. Everything we implement depends on them.
-
----
-
-### Concepts You Need to Understand
-
-#### 1. Client-Server Model
-
-**What it means:**
-
-A **client** is a program that initiates a request. A **server** is a program that waits for requests and sends back responses.
-
-This is not about physical machines — it's about roles. The same computer can run both client and server programs. In our project:
-
-- Our C++ engine is the **client** — it initiates HTTP requests.
-- The target application is the **server** — it receives and responds to those requests.
-- Our Node.js controller is also a **server** — it receives API calls from the dashboard.
-- Our React dashboard is a **client** — it sends API calls to the controller.
-
-The client-server model is the fundamental interaction pattern of the internet. Every website you visit, every API you call, every database query — they all follow this pattern.
-
-**Why this project needs it:** We are building a client (the load generator) that is specifically designed to stress-test servers. Understanding what a client does and what a server does is the absolute foundation.
-
-**Where it's used:** Everywhere. The C++ engine is a client to the target server. The dashboard is a client to the controller API. Workers are clients that register with the controller.
-
----
-
-#### 2. What an HTTP Request Actually Is
-
-**What it means:**
-
-HTTP (HyperText Transfer Protocol) is a text-based protocol for transferring data. An HTTP request is literally a structured text message sent from a client to a server.
-
-Here is an actual HTTP/1.1 request, byte for byte:
-
-```
-GET /api/users HTTP/1.1\r\n
-Host: api.myapp.com\r\n
-Accept: application/json\r\n
-Connection: keep-alive\r\n
-\r\n
+**Why threads matter:**
+Our C++ engine must send thousands of requests simultaneously. A single thread executing sequentially would have to wait for Server A to respond before sending a request to Server B. By using threads, we can have 100 threads waiting for 100 different responses simultaneously.
+
+### Chapter 8: Concurrency vs Parallelism
+These terms are often confused but mean completely different things in systems design.
+
+**Concurrency:** Dealing with multiple things at once. It is about structure. If you are cooking a meal, chopping carrots while waiting for water to boil is concurrency. You switch between tasks. In computing, a single-core CPU can run 100 threads concurrently by rapidly context-switching between them.
+
+**Parallelism:** Doing multiple things at once. It is about execution. If you hire a sous-chef to chop carrots while you boil water, that is parallelism. In computing, a multi-core CPU running threads simultaneously on different physical cores is parallelism.
+
+**Diagram:**
+```text
+Concurrency (Single Core):
+Task 1: [---]      [---]
+Task 2:      [----]     [---]
+Time ->
+
+Parallelism (Multi Core):
+Core 1: [--------Task 1---------]
+Core 2: [--------Task 2---------]
+Time ->
 ```
 
-This is not JSON. This is not binary. This is plain text with specific formatting rules:
+**I/O Concurrency vs CPU Parallelism:**
+Network programming is dominated by **I/O Concurrency**. When we send an HTTP request, the network takes maybe 50ms to respond. The CPU can execute millions of instructions in 50ms. Therefore, the thread is just "waiting". We don't need multiple physical cores (parallelism) to wait; we just need concurrency (switching to another thread while waiting).
 
-- **Line 1 (request line):** `METHOD PATH VERSION`
-  - `GET` = the HTTP method (I want to retrieve data)
-  - `/api/users` = the path I'm requesting
-  - `HTTP/1.1` = the protocol version
-- **Lines 2-4 (headers):** `Key: Value` pairs providing metadata
-  - `Host` = which server I'm talking to (important for virtual hosting)
-  - `Accept` = what format I want the response in
-  - `Connection: keep-alive` = please don't close the connection after this request
-- **Empty line:** Separates headers from body (this request has no body)
-- **`\r\n`** = carriage return + line feed (the line ending HTTP requires)
+### Chapter 9: Synchronization
+Because threads share memory, we encounter the **Shared Data Problem**.
 
-And here is what the server sends back — an HTTP response:
+**Race Conditions:**
+Imagine two threads incrementing a shared counter `x = 0`.
+The operation `x++` is actually three steps in assembly:
+1. Read `x` from RAM into CPU register.
+2. Add 1 to register.
+3. Write register back to RAM.
 
+If Thread A and Thread B do this simultaneously:
+- Thread A reads `x` (0).
+- Thread B reads `x` (0).
+- Thread A adds 1 and writes (1).
+- Thread B adds 1 and writes (1).
+The final value is 1, not 2. This is a race condition.
+
+**Mutexes (`std::mutex`):**
+A mutex (Mutual Exclusion) acts as a lock.
+```cpp
+std::mutex mtx;
+int x = 0;
+
+void increment() {
+    mtx.lock();
+    x++;
+    mtx.unlock();
+}
 ```
-HTTP/1.1 200 OK\r\n
-Content-Type: application/json\r\n
-Content-Length: 42\r\n
-\r\n
-{"users": [{"id": 1, "name": "Alice"}]}
-```
+Only one thread can hold the lock at a time. If Thread B tries to lock while Thread A holds it, Thread B is put to sleep by the OS until Thread A unlocks it.
 
-- **Line 1 (status line):** `VERSION STATUS_CODE REASON`
-- **Lines 2-3 (headers):** Response metadata
-- **Empty line:** Separator
-- **Body:** The actual data
-
-**Why this project needs it:** We are building an HTTP load generator. We need to construct these messages ourselves (at least conceptually — we may use a library for parsing, but we need to understand the format). We need to parse the responses to check status codes and measure response sizes.
-
-**Where it's used:** This is the core of what our C++ engine does — it constructs HTTP requests, sends them over a network connection, and parses the HTTP responses.
-
----
-
-#### 3. Latency
-
-**What it means:**
-
-Latency is the time between initiating an action and getting the result. In our context, it's the time between sending an HTTP request and receiving the complete response.
-
-Latency is measured in time units:
-- **Milliseconds (ms):** 1ms = 0.001 seconds. Most API latencies are in this range.
-- **Microseconds (μs):** 1μs = 0.001ms. Used for very fast operations.
-- **Nanoseconds (ns):** 1ns = 0.001μs. Used for CPU-level measurements.
-
-Latency is NOT the same as speed. A fast server with a slow network has high latency. A slow server with a fast network also has high latency. Latency is the total end-to-end time.
-
-**Components of latency:**
-```
-Total latency = Network latency (out) + Server processing time + Network latency (back)
+**Lock Guards:**
+Manually unlocking is dangerous (what if an exception is thrown?). C++ provides `std::lock_guard`, which locks in the constructor and unlocks in the destructor (RAII pattern).
+```cpp
+void increment() {
+    std::lock_guard<std::mutex> lock(mtx);
+    x++;
+}
 ```
 
-In practice, for our measurements:
+**Atomic Operations (`std::atomic`):**
+Locks are slow because putting threads to sleep requires OS kernel intervention. For simple counters, CPUs provide hardware-level instructions to perform atomic (indivisible) operations.
+```cpp
+#include <atomic>
+std::atomic<int> x(0);
+
+void increment() {
+    x++; // Lock-free, hardware-level atomicity!
+}
 ```
-Total latency = Connection time + Request send time + Server processing + Response download
+In LoadForge, we heavily use `std::atomic` for our high-speed metrics to avoid lock contention.
+
+**Deadlocks:**
+A deadlock occurs when Thread A holds Lock 1 and waits for Lock 2, while Thread B holds Lock 2 and waits for Lock 1. Both sleep forever.
+
+### Chapter 10: Networking Fundamentals
+**What a network is:** A series of interconnected computers passing messages (packets) to each other.
+
+**IP Addresses:** The logical address of a machine on a network (e.g., `192.168.1.5` or `93.184.216.34`). Like a street address.
+**Ports:** A 16-bit number (0-65535) identifying a specific process on that machine. Like an apartment number. Port 80 is HTTP, Port 443 is HTTPS.
+
+**The TCP/IP Model (4 Layers):**
+1. **Application:** HTTP, FTP, SSH. (Data: Messages)
+2. **Transport:** TCP, UDP. (Data: Segments. Adds Ports.)
+3. **Internet:** IP. (Data: Packets. Adds IP addresses. Handles routing.)
+4. **Link:** Ethernet, Wi-Fi. (Data: Frames. Adds MAC addresses.)
+
+**Encapsulation:**
+When you send an HTTP request, it gets wrapped in a TCP segment, which gets wrapped in an IP packet, which gets wrapped in an Ethernet frame. The router looks at the IP header. The receiving OS looks at the TCP header. The application looks at the HTTP data.
+
+**DNS Resolution:**
+Humans read `google.com`. Computers read `142.250.190.46`. The Domain Name System (DNS) translates domains to IPs.
+
+### Chapter 11: TCP
+TCP (Transmission Control Protocol) is the backbone of the internet.
+
+**What TCP provides:**
+1. **Reliability:** If a packet is lost, TCP automatically retransmits it.
+2. **Ordering:** Packets might arrive out of order (due to taking different routes). TCP buffers and reassembles them in the correct sequence.
+3. **Byte-stream:** It hides the concept of packets from the application. You just write a stream of bytes, and TCP chunks them up.
+
+**Three-way handshake:**
+Before sending data, TCP establishes a connection:
+1. **SYN:** Client says "I want to connect, my sequence number starts at X."
+2. **SYN-ACK:** Server says "Acknowledged X. I also want to connect, my sequence starts at Y."
+3. **ACK:** Client says "Acknowledged Y."
+Only after this 1-RTT (Round Trip Time) penalty can HTTP data be sent.
+
+**Flow Control & Congestion Control:**
+- **Flow Control (Sliding Window):** Prevents a fast sender from overwhelming a slow receiver by advertising a "receive window" (how much buffer space the receiver has left).
+- **Congestion Control:** Prevents the sender from overwhelming the physical network links (routers) by slowly ramping up transmission speed (Slow Start) and cutting speed when packets drop.
+
+### Chapter 12: Sockets
+The OS abstracts networking through **Sockets**. A socket is essentially a file descriptor (an integer) representing the network endpoint.
+
+**Socket API:**
+- `socket()`: Creates the socket descriptor.
+- `bind()`: Associates the socket with a local port (usually for servers).
+- `listen()`: Tells the OS to accept incoming connections.
+- `accept()`: Blocks until a client connects, returns a *new* socket descriptor for that specific client.
+- `connect()`: (Client-side) Initiates the TCP handshake.
+- `send()` / `recv()`: Read and write bytes.
+- `close()`: Terminates the connection.
+
+**Client Socket Workflow (LoadForge uses this):**
+```c
+int sock = socket(AF_INET, SOCK_STREAM, 0); // 1. Create TCP socket
+struct sockaddr_in server_addr; 
+// ... fill server_addr with IP and Port ...
+connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)); // 2. Handshake
+send(sock, "GET / HTTP/1.1\r\n\r\n", 18, 0); // 3. Send HTTP request
+recv(sock, buffer, sizeof(buffer), 0); // 4. Read response
+close(sock); // 5. Clean up
 ```
 
-**Why this project needs it:** Latency is one of the core metrics we report. We need to measure it accurately (using high-resolution clocks), store it efficiently (using histograms), and report it meaningfully (using percentiles).
+### Chapter 13: HTTP
+HTTP (Hypertext Transfer Protocol) is an application-layer protocol built on top of TCP. It is text-based (in versions 1.0 and 1.1).
 
-**Where it's used:** Every single request gets a latency measurement. The C++ engine timestamps each request at multiple points.
-
----
-
-#### 4. Throughput (RPS)
-
-**What it means:**
-
-Throughput is the rate of work completed per unit time. In load testing, it's typically measured as **Requests Per Second (RPS)** — how many complete request-response cycles happen each second.
-
-Important distinction:
-- **Offered load:** The rate at which we *try* to send requests (configured by the user).
-- **Achieved throughput:** The rate at which requests actually *complete*.
-
-If you configure 1,000 RPS but the server can only handle 600, the achieved throughput will be ~600 RPS, and the remaining 400 requests/second will be queuing, timing out, or failing.
-
-**Why this project needs it:** We need to generate a *specific* rate of traffic (rate control) and measure the *actual* rate of completions (throughput measurement). These are two different things.
-
-**Where it's used:** The request scheduler in the C++ engine controls the offered load. The metrics system counts completions per second for achieved throughput.
-
----
-
-#### 5. Percentiles
-
-**What it means:**
-
-A percentile tells you what percentage of values fall below a given threshold.
-
-- **P50 (median):** 50% of values are below this. This is the "typical" experience.
-- **P95:** 95% of values are below this. 1 in 20 is worse.
-- **P99:** 99% of values are below this. 1 in 100 is worse.
-- **P99.9:** 99.9% of values are below this. 1 in 1,000 is worse.
-
-**Why percentiles instead of averages?**
-
-Averages can hide horrible worst-case behavior. Consider:
+**Request Format:**
+```http
+GET /api/users HTTP/1.1
+Host: api.example.com
+User-Agent: LoadForge/1.0
+Connection: keep-alive
 
 ```
-99 requests at 10ms, 1 request at 10,000ms
+*(Note the blank line `\r\n\r\n` at the end marking the end of headers).*
 
-Average = (99 × 10 + 1 × 10000) / 100 = 109.9ms    ← Looks okay!
-P99 = 10,000ms                                       ← One in 100 users waits 10 seconds!
-```
-
-In a production system serving millions of requests, that 1% is thousands of angry users.
-
-**Why this project needs it:** We report P50, P95, P99, and P99.9 for every load test. We need a data structure (histogram) that can compute these efficiently without storing every individual latency value.
-
-**Where it's used:** The metrics system in the C++ engine. The reporting system in the controller. The latency graphs on the dashboard.
-
----
-
-#### 6. Error Rate
-
-**What it means:**
-
-The fraction of requests that failed, expressed as a percentage.
-
-```
-Error rate = (failed requests / total requests) × 100%
-```
-
-An error can be:
-- A network error (connection refused, timeout, connection reset)
-- An HTTP error (status codes 4xx or 5xx)
-
-Whether HTTP 4xx counts as an "error" depends on context. A 404 from a load test might be expected (maybe we're testing the error-handling path). A 500 is almost always a real error.
-
-**Why this project needs it:** Error rate is a critical health signal. A load test isn't just about speed — it's about correctness under load. A server that responds in 1ms but fails 50% of the time is broken.
-
-**Where it's used:** Every request result is classified as success/failure. The metrics system tracks error counts and error types.
-
----
-
-#### 7. The Difference Between the Load Generator and the Target Server
-
-**What it means:**
-
-This is worth repeating because confusion here leads to fundamental misunderstandings:
-
-| | Load Generator (LoadForge) | Target Server |
-|---|---|---|
-| Role | Client — sends requests | Server — receives and processes requests |
-| We control | Everything — rate, concurrency, duration | Nothing — it's someone else's code |
-| We measure | Request timing, errors, throughput | (Only indirectly, through our observations) |
-| Performance goal | Generate load efficiently, don't become a bottleneck | Handle the load |
-| Failure meaning | Bug in our tool | The target can't handle the load (which is useful information!) |
-
-**Critical insight:** If our load generator can't keep up with the configured rate (e.g., we configured 10,000 RPS but we can only generate 3,000), then **our tool is the bottleneck**, not the target server. Our results become meaningless. This is why we must monitor our own load generator's performance.
-
----
-
-### Exercises
-
-Do these **before** we start coding. Write your answers down (even just in a text file). These verify that you understand the foundations.
-
-#### Exercise 1: Identify the Roles
-You configure LoadForge to send requests to `https://api.myapp.com`. Which is the client? Which is the server? If you then open the LoadForge dashboard in your browser, which is the client and which is the server in *that* interaction?
-
-#### Exercise 2: Read an HTTP Request
-Given this HTTP request:
-```
-POST /api/orders HTTP/1.1
-Host: shop.example.com
+**Response Format:**
+```http
+HTTP/1.1 200 OK
 Content-Type: application/json
 Content-Length: 27
 
-{"item": "book", "qty": 2}
+{"status": "success", "id": 1}
 ```
-Answer:
-- What HTTP method is being used?
-- What path is being requested?
-- What is the request body?
-- What does Content-Length represent?
 
-#### Exercise 3: Calculate Percentiles
-Given these latencies (in ms) for 20 requests:
-```
-12, 13, 11, 14, 12, 250, 11, 13, 12, 15,
-12, 13, 11, 12, 14, 13, 12, 11, 13, 12
-```
-- What is the average latency?
-- Sort the values and find P50 (median).
-- Find P95 (the value at the 95th percentile).
-- Which metric (average or P95) better reveals the outlier?
-
-#### Exercise 4: Little's Law
-Your target server handles requests with an average latency of 100ms. You want to achieve 2,000 RPS. Using Little's Law ($L = \lambda \times W$), how many concurrent connections do you need?
-
-#### Exercise 5: Error Rate
-During a 60-second test at 500 RPS, you observe:
-- 29,500 successful responses (HTTP 200)
-- 300 HTTP 503 errors
-- 200 connection timeouts
-What is the total error rate? What is the total number of requests? Does it match the expected total (500 × 60)?
-
-#### Exercise 6: Why Not Averages?
-A server handles 1,000,000 requests. 999,990 complete in 5ms. 10 complete in 30 seconds. Calculate the average latency and the P99.999 latency. Which number would you put on a status page to represent user experience?
-
-#### Exercise 7: Load Generator as Bottleneck
-You configure LoadForge for 10,000 RPS. You observe that your load-generator machine's CPU is at 100% and the achieved RPS is only 6,000. The target server's CPU is at 40%. What is happening? Whose numbers should you trust?
+**Keep-Alive:**
+In HTTP/1.0, the server closed the TCP connection after every response. This meant incurring the 3-way handshake penalty for *every single request*. 
+HTTP/1.1 introduced Keep-Alive. The connection stays open. The client must read exactly `Content-Length` bytes to know when the current response ends so it can send the next request on the same socket.
 
 ---
 
-### What Comes After Learning Gate #1
+## Part III — First Working Load Generator
 
-Once you've worked through these exercises and are comfortable with these concepts, we will proceed to:
+Let's dive into code. We will build the C++ engine.
 
-**Milestone 1: Project Setup and Sending One HTTP Request**
+### Chapter 14: Project Setup
+We use CMake to manage the build process.
+`CMakeLists.txt`:
+```cmake
+cmake_minimum_required(VERSION 3.10)
+project(LoadForge CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_FLAGS "-pthread -O3") # -O3 for max performance, -pthread for threading
+add_executable(loadforge src/main.cpp src/network.cpp src/metrics.cpp)
+```
 
-This will introduce:
-- Setting up a C++ project with CMake
-- TCP sockets (what they are, how they work)
-- The BSD socket API
-- Sending raw bytes over a network connection
-- Constructing an HTTP request by hand
-- Reading an HTTP response
-- Measuring latency with `std::chrono`
+### Chapter 15: Sending One HTTP Request
+We encapsulate the raw socket API in a C++ class.
+```cpp
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <string>
+#include <iostream>
 
-This will bring **Learning Gate #2**, which will cover:
-- What a process is
-- What a socket is
-- What a file descriptor is
-- Blocking I/O
-- The TCP three-way handshake
+void send_single_request(const std::string& host, int port) {
+    // 1. Resolve DNS
+    struct addrinfo hints{}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res);
 
-We will build up from there, one concept at a time.
+    // 2. Create Socket
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+
+    // 3. Connect
+    connect(sock, res->ai_addr, res->ai_addrlen);
+
+    // 4. Send Request
+    std::string req = "GET / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
+    send(sock, req.c_str(), req.length(), 0);
+
+    // 5. Receive Response
+    char buffer[4096];
+    int bytes_received = recv(sock, buffer, 4096, 0);
+    std::cout << "Received " << bytes_received << " bytes.\n";
+
+    // 6. Cleanup
+    close(sock);
+    freeaddrinfo(res);
+}
+```
+
+### Chapter 16: Measuring Latency
+To measure performance, we need high-resolution timers. We use `std::chrono::steady_clock`.
+**Why not system_clock?** `system_clock` represents the wall-clock time. If the NTP server adjusts your computer's clock backwards by 1 second while a request is inflight, your latency measurement will be negative! `steady_clock` is guaranteed to never go backwards.
+
+```cpp
+auto start_time = std::chrono::steady_clock::now();
+// ... do network I/O ...
+auto end_time = std::chrono::steady_clock::now();
+auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+long latency_us = duration.count();
+```
+
+### Chapter 17: Handling Responses
+Network I/O is stream-based. `recv()` might return 100 bytes of a 200-byte response. We must loop `recv()` until the entire HTTP response is read. We do this by parsing headers to find `Content-Length`, then reading that many bytes of the body.
+
+### Chapter 18: Handling Errors
+Under extreme load, sockets will fail. 
+- `ECONNREFUSED`: Server is down or port is wrong.
+- `ETIMEDOUT`: Packets are being dropped by the network.
+- `ECONNRESET`: Server crashed mid-connection.
+Our code must check the return value of `connect()`, `send()`, and `recv()`. If they return `-1`, we inspect `errno`, log a specific error metric, close the socket, and move on. **A load tester must never crash due to target server errors.**
+
+### Chapter 19: Sending Multiple Requests
+A simple loop:
+```cpp
+for(int i=0; i<1000; i++) {
+    send_single_request("example.com", 80);
+}
+```
+**Why this is slow:** It is purely sequential and blocking. The thread spends 99% of its time sleeping while waiting for the server to reply over the network. It might generate 20 RPS on a 50ms latency connection.
+
+### Chapter 20: Concurrent Requests with Threads
+To speed it up, we could spawn a thread per request:
+```cpp
+std::vector<std::thread> threads;
+for(int i=0; i<1000; i++) {
+    threads.emplace_back(send_single_request, "example.com", 80);
+}
+for(auto& t : threads) t.join();
+```
+**The problem:** Spawning 10,000 threads will crash the OS (Thread stack size is usually 8MB; 10k threads = 80GB RAM just for stacks). The OS scheduler will thrash trying to context switch 10,000 threads.
+
+**The Solution (Thread Pool):**
+We create a fixed number of threads (e.g., equal to number of CPU cores * 2). We create a queue of tasks. The threads sit in a loop, pulling tasks from the queue and executing them. This is the **Thread Pool Pattern**.
 
 ---
 
-*End of Part I. Continue to Part II after completing Learning Gate #1 exercises.*
+## Part IV — Performance Engine
+
+Now we upgrade from a naive threaded tool to a professional Performance Engine.
+
+### Chapter 21: Request Scheduling
+We need to generate exactly *N* requests per second.
+**Naive approach:** If target is 100 RPS, send 1 request, sleep for 10ms.
+**Why it fails:** Network I/O takes time. Context switching takes time. `sleep(10)` usually sleeps for 11-15ms depending on the OS scheduler tick rate. The RPS will drift.
+
+**Token Bucket Algorithm:**
+Imagine a bucket. Every millisecond, a timer adds tokens to the bucket at a rate of *N* tokens per second. When a thread wants to send a request, it must take 1 token from the bucket.
+If the bucket is empty, the thread spins or yields. If the bucket is full, tokens overflow (we cap the burst size).
+This guarantees that over any given second, exactly *N* requests are dispatched, smoothing out micro-stutters in the OS scheduler.
+
+### Chapter 22: Connection Reuse and HTTP Keep-Alive
+Opening a TCP socket takes a 3-way handshake. If TLS (HTTPS) is involved, it takes several more round trips for cryptographic negotiation. 
+To achieve massive throughput, we MUST reuse connections. We send `Connection: keep-alive` in the HTTP header, and after reading the complete response, we *do not* call `close()`. Instead, we send the next HTTP request string down the exact same socket.
+
+### Chapter 23: Connection Pooling
+Since we have multiple threads and multiple open sockets, we need a **Connection Pool**.
+When a thread gets a token from the Rate Limiter:
+1. It asks the Pool: "Give me an idle connection."
+2. If none exist and we haven't hit the max limit, it creates a new one.
+3. If max limit is reached, it waits.
+4. The thread sends the request on the connection, reads the response.
+5. The thread returns the connection to the Pool's idle queue.
+
+### Chapter 24: Blocking vs Non-Blocking I/O
+Even with a thread pool and connection pool, threads block inside `recv()`. If we want 10,000 concurrent connections, we'd need 10,000 threads, bringing back our OS thrashing problem.
+
+**Non-blocking I/O:**
+We set the socket to `O_NONBLOCK`. Now, `recv()` returns immediately. If no data is ready, it returns `-1` with `errno == EAGAIN`.
+We then use `epoll` (Linux) or `kqueue` (Mac/BSD). These system calls allow a *single thread* to monitor 10,000 sockets. 
+The thread calls `epoll_wait()`. The OS puts the thread to sleep, and wakes it up the instant *any* of the 10,000 sockets has data ready. This is how Nginx and Node.js handle millions of connections on a single thread. This solves the **C10K Problem**.
+
+### Chapter 25: The Histogram — Measuring Latency
+Averages lie. If 99 requests take 1ms, and 1 request takes 1000ms (garbage collection pause on the server), the average is `(99*1 + 1000)/100 = 10.9ms`. The average looks great, but 1% of your users had a terrible 1-second delay.
+
+We use **Histograms** to track the exact distribution. We create an array of buckets.
+- Bucket 0: 0-1ms
+- Bucket 1: 1-2ms
+...
+- Bucket N: 999-1000ms.
+When a request completes in 14ms, we do `histogram[14]++`.
+
+Because we measure in microseconds up to 60 seconds, a linear array would need 60,000,000 slots. Instead, we use **Logarithmic Buckets** or High Dynamic Range (HDR) Histograms, which provide high precision for small values (1-10ms) and lower precision for huge values (50,000ms), compressing the array into a few kilobytes. We use `std::atomic<uint64_t>` for the buckets to allow concurrent lock-free updates from all threads.
+
+### Chapter 26: Metrics Collection
+Our `MetricsCollector` class holds the atomic histogram, an atomic counter for successful requests, and atomic counters for various error types.
+Every 1 second, a background reporter thread reads all the atomics, resets them, and formats a JSON payload containing the snapshot of the last second's performance.
+
+### Chapter 27: The Coordinated Omission Problem
+This is the most critical concept in modern load testing (popularized by Gil Tene).
+If your load generator blocks waiting for a slow response, it fails to send the *next* scheduled request on time. 
+Imagine we want to send 1 request per second.
+- T=0: Send Req 1. Server pauses for 5 seconds.
+- T=5: Receive Req 1. (Latency = 5s).
+- T=5: Send Req 2. Server answers instantly. (Latency = 0s).
+- T=5: Send Req 3...
+
+If you measure latency from *when the request was sent* to *when it was received*, Req 2 took 0s.
+But Req 2 was *supposed* to be sent at T=1! The user sitting at their browser has actually been waiting 4 seconds for Req 2 to even start. 
+To fix this, LoadForge measures latency from the **Intended Schedule Time**, not the actual transmission time. If the rate limiter scheduled a request for T=1, and we couldn't send it until T=5, its latency is recorded as 4s + actual network time.
+
+---
+
+## Part V — Performance Analysis
+
+*(Continuing depth into the remaining chapters...)*
+
+### Chapter 28: Throughput & Latency In Depth
+Throughput is a measure of capacity (Bytes/sec or Requests/sec). Latency is a measure of delay. They are related by Queueing Theory (Little's Law: `Concurrency = Throughput * Latency`). If latency increases, you need more concurrent connections to maintain the same throughput.
+
+### Chapter 30: Percentiles In Depth
+Percentiles sort all requests from fastest to slowest.
+- **P50 (Median):** 50% of requests were faster than this. The typical user experience.
+- **P90:** 90% were faster.
+- **P99:** The "Tail Latency". The experience of the unluckiest 1% of users. In microservice architectures, where one user action triggers 100 internal service calls, the P99 latency of a service often becomes the P50 latency of the overall system!
+
+### Chapter 32: Bottleneck Detection
+When the load test fails to reach the target RPS, you must investigate:
+- **Client Bottleneck:** LoadForge CPU is at 100%. (Fix: Add more worker nodes).
+- **Network Bottleneck:** Latency is high, CPU is low, packet drops reported by OS. (Fix: Upgrade network link).
+- **Server CPU Bottleneck:** Target server CPU 100%. (Fix: Optimize code, scale horizontally).
+- **Server DB Bottleneck:** Target server CPU 20%, but P99 latency is massive. Threads are waiting on DB locks.
+
+---
+
+## Part VI & VII — Distributed System and Controller
+
+To scale beyond one machine, we introduce a Node.js **Controller**.
+
+### Chapter 34-38: Controller Architecture
+The Node.js server acts as the brains. It exposes a REST API (`POST /tests`) to the React frontend. It maintains a WebSocket connection with the frontend for real-time dashboard updates.
+
+### Chapter 39-43: Distributed Workers
+A single C++ engine might max out at 50,000 RPS on an 8-core VM. To hit 1,000,000 RPS, we need 20 VMs.
+**Worker Registration:**
+When a worker boots, it sends a REST `POST /workers/register` to the Controller. It then sends an HTTP heartbeat every 5 seconds.
+**Work Distribution:**
+If the user requests 1,000,000 RPS, the Controller sees 20 active workers and sends a command to each: `{"target": "http...", "rps": 50000}`.
+**Aggregation:**
+Every second, 20 workers send their local histograms to the Controller. The Controller merges them by simply summing the arrays: `global_histogram[i] = w1[i] + w2[i] + ... + w20[i]`. It then computes the global P99 and broadcasts it to the React UI.
+
+---
+
+## Part VIII to XIV — UI, DB, Observability, Deployment
+
+*(The following chapters complete the textbook structure, summarizing the remaining implementation phases.)*
+
+### Chapter 44-46: Dashboard (React)
+Using React and Recharts, we connect to the Controller's WebSocket endpoint. As the `global_metrics` JSON payload arrives every second, we push it into an array in React state, rendering a beautiful moving timeline of P50/P90/P99 latency.
+
+### Chapter 47-48: Persistence (PostgreSQL)
+We store test configurations and historical timelines. Because histograms are large arrays, we store them in a `JSONB` column in Postgres, allowing flexible querying without complex relational schemas.
+
+### Chapter 49-51: Observability (Prometheus & Grafana)
+While the React UI shows the *load test* metrics, we need to monitor the *health of the LoadForge system itself*. We expose a `/metrics` endpoint on the C++ workers. Prometheus scrapes this, tracking LoadForge CPU, Memory, and Goroutines/Threads. Grafana visualizes this system health.
+
+### Chapter 52-54: Deployment (Docker & Compose)
+We write `Dockerfile`s for the C++ Worker (using multi-stage builds to compile C++ and output a tiny Alpine binary), the Node Controller, and the React UI. A `docker-compose.yml` wires up the network, PostgreSQL, and starts the entire cluster with `docker compose up --scale worker=5`.
+
+### Chapter 58-60: Final Architecture Walkthrough
+The complete flow: User -> React UI -> REST -> Node Controller -> Postgres & RPC -> C++ Workers -> Target Server. The C++ Workers use epoll, thread pools, and lock-free atomic histograms to blast traffic, merging results back up the chain for real-time visualization.
+
+### Chapter 61-62: Interview Preparation
+**Q: How did you solve the C10K problem in your load generator?**
+A: I moved from a blocking thread-per-connection model to a non-blocking event loop using `epoll`. This allowed a small pool of threads to manage thousands of active socket connections asynchronously.
+
+**Q: Explain Coordinated Omission and how LoadForge fixes it.**
+A: Coordinated omission happens when a blocking load generator fails to measure the time a request spent waiting to be sent due to server slowdowns. LoadForge fixes this by measuring latency from the *intended schedule time* generated by our Token Bucket rate limiter, rather than the actual transmission time.
+
+**Q: How did you aggregate metrics across distributed workers?**
+A: I used atomic arrays representing logarithmic histogram buckets on the C++ workers. These were serialized to JSON every second and sent to the Node.js controller, which summed the arrays to produce a mathematically accurate global percentile, completely avoiding the need to store individual request data.
+
+---
+*End of Document. LoadForge represents a complete vertical slice of modern backend engineering.*
+
+# Expanded Chapters
+
+## Part III — First Working Load Generator (Continued)
+
+### Chapter 17: Handling Responses
+Network reads are not guaranteed to pull the entire message in one `recv()` call. TCP is a stream protocol; a 2KB HTTP response might arrive in two 1KB chunks.
+```cpp
+std::string read_full_response(int sock) {
+    char buffer[4096];
+    std::string response;
+    while (true) {
+        int bytes = recv(sock, buffer, sizeof(buffer)-1, 0);
+        if (bytes <= 0) break; // Error or connection closed
+        buffer[bytes] = '\0';
+        response += buffer;
+        
+        // Very basic HTTP 1.0 logic: read until close.
+        // For HTTP 1.1, we must parse Content-Length or Chunked Encoding!
+        if (response.find("\r\n\r\n") != std::string::npos) {
+            // Further parsing required for body length.
+            break; 
+        }
+    }
+    return response;
+}
+```
+In LoadForge, we implement a lightweight HTTP parser. First, we scan for `\r\n\r\n` to isolate headers. Then we extract the `Content-Length: X` header. Finally, we loop `recv()` until exactly `X` body bytes are consumed. If `Transfer-Encoding: chunked` is used, we read hex lengths and chunks in a state machine until the `0\r\n\r\n` terminator is reached.
+
+### Chapter 18: Handling Errors
+Networks are inherently unreliable. When pushing 100,000 RPS, sockets *will* fail. 
+- **Connection Refused (`ECONNREFUSED`):** The server OS is alive, but no process is listening on the target port (or the backlog queue is full).
+- **Connection Timeout (`ETIMEDOUT`):** Packets were sent, but no SYN-ACK was received. The network might be dropping packets, or a firewall is silently dropping traffic.
+- **Connection Reset (`ECONNRESET`):** The target server forcefully aborted the connection, usually because it crashed or ran out of resources.
+
+In C++, checking errors involves inspecting the return value of system calls and reading `errno`:
+```cpp
+int bytes = send(sock, req.c_str(), req.length(), 0);
+if (bytes < 0) {
+    if (errno == ECONNRESET) {
+        metrics.increment_error_reset();
+    } else if (errno == ETIMEDOUT) {
+        metrics.increment_error_timeout();
+    }
+    close(sock);
+    return false;
+}
+```
+
+### Chapter 19: Sending Multiple Requests
+If we want to test load, one request isn't enough. We start with a sequential loop:
+```cpp
+for (int i = 0; i < 1000; i++) {
+    send_single_request("api.example.com", 80);
+}
+```
+**Why this fails as a load tester:** It is strictly sequential. 
+1. Call `connect()` (Wait 20ms).
+2. Call `send()` (Wait 1ms).
+3. Call `recv()` (Wait 50ms).
+The thread is asleep for 71ms per request. The max throughput is roughly `1000ms / 71ms = ~14 requests per second`. We need concurrency.
+
+### Chapter 20: Concurrent Requests with Threads
+To overlap the waiting times, we use multiple threads. 
+```cpp
+#include <vector>
+#include <thread>
+
+void worker_thread(int requests) {
+    for(int i=0; i<requests; i++) send_single_request("api.example.com", 80);
+}
+
+int main() {
+    std::vector<std::thread> threads;
+    for(int i=0; i<10; i++) {
+        threads.emplace_back(worker_thread, 100);
+    }
+    for(auto& t : threads) t.join();
+}
+```
+If we use 10 threads, our 14 RPS jumps to 140 RPS. But if we want 100,000 RPS, we cannot spawn 7,000 threads. OS context switching will consume 100% of the CPU, and thread stacks will consume gigabytes of RAM. This leads us to Thread Pools and Non-Blocking I/O in the next part.
+
+## Part IV — Performance Engine (Expanded)
+
+### Chapter 21: Request Scheduling (Token Bucket Algorithm)
+To generate precise load (e.g., 5,000 RPS), we must schedule requests.
+**The Token Bucket Algorithm:**
+Imagine a bucket that holds a maximum of `Burst` tokens. 
+A background timer adds tokens to the bucket at a rate of `RPS` tokens per second.
+When a worker thread wants to send a request, it must acquire a token. If the bucket is empty, the thread must yield or wait.
+
+```cpp
+class TokenBucket {
+    std::atomic<uint64_t> tokens;
+    uint64_t max_tokens;
+    uint64_t refill_rate;
+    auto last_refill = std::chrono::steady_clock::now();
+    std::mutex mtx;
+
+public:
+    void refill() {
+        auto now = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_refill);
+        uint64_t new_tokens = (duration.count() * refill_rate) / 1000;
+        if (new_tokens > 0) {
+            std::lock_guard<std::mutex> lock(mtx);
+            tokens = std::min(max_tokens, tokens + new_tokens);
+            last_refill = now;
+        }
+    }
+    
+    bool consume() {
+        uint64_t current = tokens.load();
+        while (current > 0) {
+            if (tokens.compare_exchange_weak(current, current - 1)) return true;
+        }
+        return false;
+    }
+};
+```
+
+### Chapter 22: Connection Reuse and HTTP Keep-Alive
+A TCP handshake takes 1 full Round Trip Time (RTT). If ping is 50ms, connecting takes 50ms before any data is sent. 
+We avoid this by using HTTP Keep-Alive.
+1. Connect once.
+2. Send Request 1.
+3. Read Response 1 fully.
+4. Send Request 2 down the *exact same socket*.
+This increases throughput dramatically and reduces socket exhaustion (running out of ephemeral ports).
+
+### Chapter 23: Connection Pooling
+Instead of threads owning sockets, we implement a `ConnectionPool`. 
+It holds two lists: `idle_connections` and `active_connections`.
+When a thread gets a token, it calls `pool.acquire()`. If an idle connection exists, it is reused. If not, and the pool isn't full, a new socket is opened. After the request completes, the thread calls `pool.release()`.
+
+### Chapter 24: Blocking vs Non-Blocking I/O
+To scale beyond a few hundred connections, we must abandon blocking I/O entirely. We set sockets to non-blocking using `fcntl(sock, F_SETFL, O_NONBLOCK)`. 
+We then use `epoll` in an event loop:
+1. `epoll_create()` to make an epoll instance.
+2. `epoll_ctl()` to add our non-blocking sockets.
+3. `epoll_wait()` to block the thread until *one or more* sockets are ready to read or write.
+A single thread can now juggle 10,000 active HTTP requests simultaneously.
+
+### Chapter 25: The Histogram — Measuring Latency Distributions
+We use High Dynamic Range (HDR) Histograms. 
+A naive array `int buckets[60000]` for milliseconds wastes space and lacks microsecond precision.
+Instead, we group values exponentially. 
+- Buckets for 1µs to 1000µs (1µs precision).
+- Buckets for 1ms to 10ms (10µs precision).
+- Buckets for 10ms to 100ms (100µs precision).
+This allows us to track latencies up to hours with high precision where it matters, using a very small memory footprint. We use `std::atomic<uint64_t>` for each bucket so all `epoll` worker threads can record metrics lock-free.
+
+### Chapter 26: Metrics Collection
+Our Engine maintains interval metrics (last 1 second) and cumulative metrics (entire test). 
+Every second, a snapshot thread:
+1. Reads all atomic counters (Requests, Errors, Bytes).
+2. Reads and resets the interval histogram.
+3. Packages this into a JSON struct.
+4. Pushes it to a queue to be sent to the Controller.
+
+### Chapter 27: The Load Engine — Putting It All Together
+The core engine consists of:
+- 1 Configuration Manager.
+- 1 Token Bucket Rate Limiter.
+- 1 Event Loop thread per physical CPU core (running `epoll`).
+- 1 Connection Pool per Event Loop.
+- 1 Background Metrics Reporter thread.
+
+## Part V — Performance Analysis (Expanded)
+
+### Chapter 28: Throughput
+Throughput is the actual work completed over time. Measured in RPS (Requests Per Second) or MB/s. 
+Target RPS is what the user asked for. Achieved RPS is what the engine actually accomplished. If Target > Achieved, the system is bottlenecked (client CPU, network, or server rejection).
+
+### Chapter 29: Latency In Depth
+Latency breaks down into:
+- **DNS Resolution Time:** Usually cached, but initially slow.
+- **TCP Connect Time:** Network distance (Ping).
+- **TLS Handshake Time:** Crypto overhead.
+- **TTFB (Time to First Byte):** How long the server took to process the request and execute DB queries.
+- **Download Time:** Time to transfer the body data.
+
+### Chapter 30: Percentiles In Depth
+If P50 is 10ms and P99 is 500ms, half your users have a fast experience, but 1 in 100 hit a massive wall. In modern distributed systems, a user request might fan out to 50 microservices. If any one of those 50 hits the P99 latency, the entire user request takes 500ms. Therefore, optimizing P99 is often more critical than optimizing P50.
+
+### Chapter 31: Coordinated Omission (Detailed)
+First identified by Gil Tene. 
+If a load tester sends requests sequentially, and the target server pauses for 10 seconds (e.g., GC pause), the load tester waits. It records 1 request taking 10 seconds. But what about the 10,000 requests that *should* have been sent during those 10 seconds? They were delayed by the tester itself!
+**The Fix:** LoadForge records the *intended* schedule time of every request when generating it. Latency = `Response_Time - Intended_Schedule_Time`. This accurately reflects what a real user arriving during the server pause would experience.
+
+### Chapter 32: Bottleneck Detection
+- Client CPU at 100%: Load generator needs more cores.
+- Server CPU at 100%: Application code is slow.
+- Network dropped packets: Switch or NIC is saturated.
+- Server memory increasing: Memory leak.
+
+### Chapter 33: Benchmarking Methodology
+Never benchmark a cold server. Java/C# applications need a warm-up phase to allow JIT compilers to convert bytecode to machine code, and for caches to populate. LoadForge supports a `--warmup 30s` flag.
+
+## Part VI & VII — Controller & Distributed System (Expanded)
+
+### Chapter 34: The Controller's Role
+The Node.js Controller is the brain. It is responsible for accepting test definitions, orchestrating C++ workers, merging metrics, and feeding the React UI.
+
+### Chapter 35: REST API Design
+The Controller exposes standard endpoints:
+- `POST /api/tests` (Start test)
+- `GET /api/tests/:id` (Get results)
+- `POST /api/workers/register` (Worker join)
+
+### Chapter 36: Worker Management
+Workers announce themselves with hardware stats (CPU cores, RAM). The Controller keeps them in an active registry. If a test requests 10,000 RPS, and 4 workers are active, the Controller sends a task to each worker for 2,500 RPS.
+
+### Chapter 37: Metrics Aggregation
+When 4 workers send their 1-second interval histograms to the Controller, the Controller iterates through the bucket arrays and sums them index by index. It then computes the global P50/90/99 from this unified array.
+
+### Chapter 38: WebSockets for Real-Time Updates
+Polling the API every second is inefficient. The React dashboard opens a WebSocket connection to the Controller. As the Controller merges worker metrics, it immediately broadcasts a JSON packet down the socket, enabling 60fps chart animations.
+
+### Chapter 39: Why One Machine Isn't Enough
+A standard Linux box has ~65,000 ephemeral ports. To test 1,000,000 concurrent websocket connections, you physically need at least 16 IP addresses (or 16 machines). Additionally, NIC (Network Interface Card) bandwidth maxes out (e.g., 10Gbps). 
+
+### Chapter 40: Distributed Architecture
+LoadForge uses a Star topology. The Controller is the center. Workers are the points. Workers do not communicate with each other.
+
+### Chapter 41: RPC vs REST
+For initial simplicity, workers communicate via HTTP JSON. However, at extreme scale, parsing JSON is slow. The architecture is designed to be easily swappable to gRPC/Protocol Buffers for binary, compressed RPC communication.
+
+### Chapter 42: Worker Registration and Discovery
+Workers implement a heartbeat thread. Every 5 seconds, they POST to the Controller. If the Controller misses 3 heartbeats, the worker is marked DEAD.
+
+### Chapter 43: Failure Handling
+If a worker dies mid-test, the Controller recalculates the load. It sends a message to the surviving workers to increase their RPS share to cover the loss of the dead worker.
+
+## Part VIII — Dashboard (Expanded)
+
+### Chapter 44: React Architecture
+The frontend is a Single Page Application (SPA). It uses Context API to maintain global state for the active test, and customized React hooks (`useWebSocket`) to manage the real-time data stream.
+
+### Chapter 45: Real-Time Visualization
+We use `recharts`. The data structure is a rolling window array of the last 60 seconds of metrics. Every WebSocket message appends to the array and shifts the oldest element off, creating a smooth scrolling graph.
+
+### Chapter 46: UX Design for Load Testing
+The dashboard emphasizes clear status signals. Red for high error rates, green for healthy. P99 latency is prioritized visually over average latency.
+
+## Part IX — Persistence (Expanded)
+
+### Chapter 47: PostgreSQL
+We use Postgres because it offers strict ACID guarantees for test metadata, while offering `JSONB` columns which are perfect for storing our serialized histograms and dynamic test configurations.
+
+### Chapter 48: Data Modeling
+- `tests`: id, target_url, rps, duration, status, created_at.
+- `workers`: id, ip_address, status, last_heartbeat.
+- `metrics_timeline`: test_id, timestamp, global_histogram (JSONB), total_requests, errors.
+
+## Part X & XI — Observability and Deployment (Expanded)
+
+### Chapter 49: What Is Observability?
+Observing our own system. We must know if the load tester is the bottleneck.
+
+### Chapter 50: Prometheus
+We expose a `/metrics` endpoint on the C++ workers. Prometheus scrapes it. It stores `loadforge_worker_cpu_usage` and `loadforge_worker_memory_bytes`.
+
+### Chapter 51: Grafana
+We provide a pre-built Grafana dashboard JSON file that visualizes the Prometheus data, alerting us if a worker is running out of file descriptors.
+
+### Chapter 52-54: Docker and Deployment
+The entire stack is containerized. 
+The `docker-compose.yml` spins up:
+- PostgresDB
+- Node Controller
+- React Frontend
+- 3x C++ Workers
+- Prometheus
+- Grafana
+A developer can start the entire distributed platform on their laptop with one command: `docker compose up`.
+
+## Part XIV — Interview Preparation (Expanded)
+
+### Chapter 61: Explaining the Project
+When asked "What did you build?", your answer should be: "I engineered a distributed, high-concurrency load testing platform from scratch. I built a C++ engine utilizing non-blocking I/O (epoll) and thread pools to generate massive traffic. To solve coordinated omission, I implemented a token-bucket rate limiter and HDR histograms. I orchestrated multiple C++ nodes using a Node.js controller with PostgreSQL, streaming real-time metrics via WebSockets to a React dashboard."
+
+### Chapter 62: Common Interview Questions (20 Detailed Q&A)
+
+**Q1: What is the difference between a process and a thread?**
+A: A process is an isolated execution environment with its own memory space (heap, data). A thread is a unit of execution within a process; threads share the parent process's memory space (heap/data) but maintain their own execution stack.
+
+**Q2: How did you achieve high concurrency in C++?**
+A: I avoided the "thread-per-connection" model which causes OS thrashing. Instead, I used a thread pool paired with asynchronous, non-blocking I/O using `epoll` on Linux. This allows a single event-loop thread to multiplex thousands of active socket connections.
+
+**Q3: Explain the Coordinated Omission problem.**
+A: Coordinated omission occurs when a load generator uses blocking I/O and stalls when the target server slows down. The generator fails to send subsequent requests on time, and therefore fails to measure the wait time those requests experienced. It artificially compresses tail latency. I solved it by recording the *intended schedule time* (via a rate limiter) and measuring latency against that, not the actual dispatch time.
+
+**Q4: How does your Token Bucket algorithm work?**
+A: It's used for precise rate limiting. A bucket has a max capacity of tokens. A timer adds tokens at a fixed rate (the target RPS). Threads must acquire a token before sending a request. If empty, they yield. This ensures precise load generation without micro-bursting.
+
+**Q5: Why did you use Atomic operations instead of Mutexes for metrics?**
+A: Mutexes cause lock contention; when thousands of requests complete simultaneously, threads would block each other just to increment a counter, killing throughput. `std::atomic` utilizes hardware-level lock-free instructions (like compare-and-swap), allowing massive concurrency with minimal overhead.
+
+**Q6: What is a TCP 3-way handshake?**
+A: It is how TCP establishes a connection. Client sends SYN. Server replies SYN-ACK. Client replies ACK. It guarantees both sides are ready to communicate.
+
+**Q7: How did you optimize connection overhead?**
+A: By implementing Connection Pooling and HTTP Keep-Alive. Instead of closing the socket and incurring a new 3-way handshake for every request, we reuse the open TCP socket for subsequent HTTP requests.
+
+**Q8: Why did you choose Logarithmic Histograms?**
+A: Storing individual request latencies consumes too much memory (60 million data points for a 60s 1M RPS test). A standard array of milliseconds lacks microsecond precision. Logarithmic buckets provide high precision for small values and lower precision for huge values, compressing millions of data points into a few kilobytes.
+
+**Q9: What happens if a worker node crashes during a test?**
+A: The Node.js controller detects the failure via missing heartbeats. It recalculates the total required RPS, divides it among the remaining healthy workers, and sends them a control message to instantly ramp up their load to cover the deficit.
+
+**Q10: Why did you separate the Control Plane from the Data Plane?**
+A: The data plane (C++ workers hitting the target) handles immense traffic and is highly volatile. The control plane (Node Controller) manages test state. Separating them ensures that network congestion or CPU exhaustion on the data plane doesn't crash the management system.
+
+**Q11: How do you read a complete HTTP response?**
+A: TCP is a stream, so `recv()` might return partial data. I buffer the data until I find the `\r\n\r\n` header terminator, parse the `Content-Length` header, and then continue calling `recv()` until exactly that many body bytes have been accumulated.
+
+**Q12: What is the C10K problem?**
+A: The challenge of handling 10,000 concurrent connections. Legacy systems used one thread per connection, running out of RAM and CPU context-switch time. The solution is non-blocking I/O with event notification systems like `epoll` or `kqueue`.
+
+**Q13: Why Node.js for the controller?**
+A: Node.js's event-driven, single-threaded architecture is exceptionally good at handling thousands of lightweight I/O bound connections (like WebSockets from the frontend and REST calls from the workers) making it perfect for the orchestration tier.
+
+**Q14: Explain P99 Latency and why it matters.**
+A: P99 latency means 99% of requests were faster than this value, and 1% were slower. It represents the "tail". In modern microservices, one user request might fan out to 50 internal services. If any one service hits its P99 delay, the whole user request is delayed. 
+
+**Q15: How did you merge metrics from distributed workers?**
+A: Each worker sends a fixed-size array representing its latency histogram. The controller simply performs an element-wise sum of these arrays: `merged[i] = w1[i] + w2[i]`. This is incredibly fast and mathematically perfect.
+
+**Q16: What is a memory leak, and how did you check your C++ engine for them?**
+A: A memory leak occurs when dynamically allocated memory is not freed. I used Valgrind and AddressSanitizer during development, and relied heavily on modern C++ RAII (Resource Acquisition Is Initialization) and smart pointers to guarantee cleanup.
+
+**Q17: How did you implement real-time UI updates?**
+A: Instead of the React app polling the server every second (which wastes bandwidth and adds latency), the controller pushes data over a persistent WebSocket connection directly to the React state.
+
+**Q18: What is port exhaustion?**
+A: When a client connects to a server, it uses an ephemeral port. A machine only has about 65,000 ports. If you open 65,000 connections without reusing them, the OS cannot open any more until they cycle out of the `TIME_WAIT` state.
+
+**Q19: How do you prevent LoadForge from being used for DDoS attacks?**
+A: In production, the controller enforces target validation. It requires a verification token to be placed on the target server (e.g., in a `loadforge.txt` file) before it will authorize the worker fleet to begin firing traffic.
+
+**Q20: What was the hardest bug you faced in this project?**
+A: *(Model Answer)*: Debugging partial TCP reads. Initially, my code assumed `recv()` would return the entire HTTP response. Under heavy load, responses got fragmented. My parser failed, causing the engine to send the next request out of sync, leading to cascading connection resets. I had to rewrite the network layer to use a robust state machine that properly buffered and parsed `Content-Length`.
