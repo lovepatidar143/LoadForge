@@ -21,7 +21,7 @@ LoadForge is an engineering learning project designed to teach systems programmi
 
 The complete technical book for this project lives at:
 
-📖 [`docs/LOADFORGE_FROM_SCRATCH.md`](docs/LOADFORGE_FROM_SCRATCH.md)
+📖 [`docs`](docs)
 
 This document explains every concept, design decision, and implementation detail from zero.
 
